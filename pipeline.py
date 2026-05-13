@@ -28,5 +28,13 @@ dllm_model = AutoModelForCausalLM.from_pretrained(
 
 def generate_dllm(prompt):
     inputs = dllm_tokenizer(prompt, return_tensors="pt").to(device)
-    outputs = dllm_model.generate(**inputs, steps=64, do_sample=False)
+    outputs = dllm_model.generate(
+        inputs=inputs["input_ids"],
+        gen_length=512,
+        block_length=32,
+        threshold=0.5,
+        editing_threshold=0,
+        eos_early_stop=True,
+        temperature=0.0
+    )
     return dllm_tokenizer.decode(outputs[0], skip_special_tokens=True)
