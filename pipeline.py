@@ -11,7 +11,7 @@ quantization_config = None
 if device == "cuda":
     quantization_config = BitsAndBytesConfig(
         load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_compute_dtype=torch.float16,
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4"
     )
@@ -33,7 +33,7 @@ def load_ar():
             "Qwen/Qwen2.5-Coder-7B-Instruct", 
             device_map="auto", 
             quantization_config=quantization_config,
-            torch_dtype=torch.float32 if device == "cpu" else torch.bfloat16
+            torch_dtype=torch.float32 if device == "cpu" else torch.float16
         )
 
 def unload_ar():
@@ -59,8 +59,8 @@ def load_dllm():
             "inclusionAI/LLaDA2.1-mini", 
             trust_remote_code=True, 
             device_map="auto",
-            quantization_config=quantization_config,
-            torch_dtype=torch.float32 if device == "cpu" else torch.bfloat16
+            # quantization_config=quantization_config,
+            torch_dtype=torch.float32 if device == "cpu" else torch.float16
         )
 
 def unload_dllm():
