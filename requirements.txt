@@ -79,3 +79,4 @@ urllib3==2.7.0
 xxhash==3.7.0
 yarl==1.23.0
 zss==1.2.0
+bitsandbytes

@@ -1,10 +1,20 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 import torch
 import gc
 
 # Device Selection
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
+
+# Configure 4-bit quantization if on CUDA
+quantization_config = None
+if device == "cuda":
+    quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4"
+    )
 
 # Global references to models and tokenizers to allow lazy-loading and dynamic unloading
 _ar_model = None
@@ -17,11 +27,12 @@ def load_ar():
     if _ar_model is None:
         # First unload the other model to free VRAM
         unload_dllm()
-        print("Loading Autoregressive model (Qwen2.5-Coder-7B-Instruct)...")
+        print("Loading Autoregressive model (Qwen2.5-Coder-7B-Instruct) in 4-bit...")
         _ar_tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-Coder-7B-Instruct")
         _ar_model = AutoModelForCausalLM.from_pretrained(
             "Qwen/Qwen2.5-Coder-7B-Instruct", 
             device_map="auto", 
+            quantization_config=quantization_config,
             torch_dtype=torch.float32 if device == "cpu" else torch.bfloat16
         )
 
@@ -42,12 +53,13 @@ def load_dllm():
     if _dllm_model is None:
         # First unload the other model to free VRAM
         unload_ar()
-        print("Loading Diffusion LLM (LLaDA2.1-mini)...")
+        print("Loading Diffusion LLM (LLaDA2.1-mini) in 4-bit...")
         _dllm_tokenizer = AutoTokenizer.from_pretrained("inclusionAI/LLaDA2.1-mini")
         _dllm_model = AutoModelForCausalLM.from_pretrained(
             "inclusionAI/LLaDA2.1-mini", 
             trust_remote_code=True, 
             device_map="auto",
+            quantization_config=quantization_config,
             torch_dtype=torch.float32 if device == "cpu" else torch.bfloat16
         )
 
