@@ -77,7 +77,13 @@ def unload_dllm():
 
 def generate_ar(prompt):
     load_ar()
-    inputs = _ar_tokenizer(prompt, return_tensors="pt").to(device)
+
+    messages = [
+        {"role": "user", "content": prompt}
+    ]
+    text_input = _ar_tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+    inputs = _ar_tokenizer(text_input, return_tensors="pt").to(device)
     input_length = inputs["input_ids"].shape[1]
     outputs = _ar_model.generate(**inputs, max_new_tokens=512, do_sample=False, temperature=0.0) 
     generated_tokens = outputs[0][input_length:]
