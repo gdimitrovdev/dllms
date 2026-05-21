@@ -78,8 +78,10 @@ def unload_dllm():
 def generate_ar(prompt):
     load_ar()
     inputs = _ar_tokenizer(prompt, return_tensors="pt").to(device)
+    input_length = inputs["input_ids"].shape[1]
     outputs = _ar_model.generate(**inputs, max_new_tokens=512, do_sample=False, temperature=0.0) 
-    return _ar_tokenizer.decode(outputs[0], skip_special_tokens=True)
+    generated_tokens = outputs[0][input_length:]
+    return _ar_tokenizer.decode(generated_tokens, skip_special_tokens=True)
 
 def generate_dllm(prompt):
     load_dllm()
