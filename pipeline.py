@@ -2,6 +2,30 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 import torch
 import gc
 
+
+def _create_bidirectional_mask_shim(config, inputs_embeds, attention_mask=None,
+                                    encoder_hidden_states=None, past_key_values=None,
+                                    or_mask_function=None, and_mask_function=None, **kwargs):
+    """
+    Full-attention (bidirectional) mask shim for transformers versions that moved/renamed
+    create_bidirectional_mask. Returns None, which tells SDPA to do full attention — correct
+    for a bidirectional diffusion LM like LLaDA.
+    """
+    return None
+
+# Try to import the real one first; fall back to the shim if missing or broken
+try:
+    from transformers.masking_utils import create_bidirectional_mask
+except (ImportError, ModuleNotFoundError, AttributeError):
+    import transformers
+    if not hasattr(transformers, 'masking_utils'):
+        mod = types.ModuleType('transformers.masking_utils')
+        sys.modules['transformers.masking_utils'] = mod
+        setattr(transformers, 'masking_utils', mod)
+    transformers.masking_utils.create_bidirectional_mask = _create_bidirectional_mask_shim
+    print("[Shim] Injected create_bidirectional_mask shim into transformers.masking_utils")
+
+
 # Device Selection
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
