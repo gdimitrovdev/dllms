@@ -15,15 +15,14 @@ def _create_bidirectional_mask_shim(config, inputs_embeds, attention_mask=None,
 
 # Try to import the real one first; fall back to the shim if missing or broken
 try:
-    from transformers.masking_utils import create_bidirectional_mask
-except (ImportError, ModuleNotFoundError, AttributeError):
-    import transformers
-    if not hasattr(transformers, 'masking_utils'):
-        mod = types.ModuleType('transformers.masking_utils')
-        sys.modules['transformers.masking_utils'] = mod
-        setattr(transformers, 'masking_utils', mod)
-    transformers.masking_utils.create_bidirectional_mask = _create_bidirectional_mask_shim
-    print("[Shim] Injected create_bidirectional_mask shim into transformers.masking_utils")
+    import transformers.masking_utils
+except (ImportError, ModuleNotFoundError):
+    mod = types.ModuleType('transformers.masking_utils')
+    sys.modules['transformers.masking_utils'] = mod
+    setattr(transformers, 'masking_utils', mod)
+
+transformers.masking_utils.create_bidirectional_mask = _create_bidirectional_mask_shim
+print("[Shim] Injected create_bidirectional_mask shim into transformers.masking_utils")
 
 
 # Device Selection
