@@ -45,6 +45,7 @@ def load_all_canitedit_samples(split_name="test", limit=100):
     for index in range(end_index):
         sample = split_dataset[index]
         before_code = sample["before"]
+        after_code = sample["after"]
         instruction = sample["instruction_descriptive"]
         
         # Keep the mock constraints as in original code
@@ -55,6 +56,7 @@ def load_all_canitedit_samples(split_name="test", limit=100):
         samples.append({
             "index": index,
             "before": before_code,
+            "after": after_code,
             "instruction": instruction,
             "constraints": mock_constraints
         })

@@ -40,9 +40,21 @@ def get_ast_node_count(node):
         count += get_ast_node_count(child)
     return count
 
+
+def parse_python(code):
+    return parser.parse(bytes(code, "utf8"))
+
+
+def is_valid_python(code):
+    if not code.strip():
+        return False
+
+    tree = parse_python(code)
+    return not tree.root_node.has_error
+
 def calculate_ast_deviation(code_prefix, code_suffix):
-    tree_prefix = parser.parse(bytes(code_prefix, "utf8"))
-    tree_suffix = parser.parse(bytes(code_suffix, "utf8"))
+    tree_prefix = parse_python(code_prefix)
+    tree_suffix = parse_python(code_suffix)
 
     nodes_p = get_ast_node_count(tree_prefix.root_node)
     nodes_s = get_ast_node_count(tree_suffix.root_node)

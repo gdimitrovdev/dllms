@@ -3,6 +3,12 @@ import torch
 import gc
 
 
+MAX_GENERATION_TOKENS = 1024
+LLADA_THRESHOLD = 0.7
+LLADA_EDITING_THRESHOLD = 0.5
+LLADA_MAX_POST_STEPS = 16
+
+
 def _create_bidirectional_mask_shim(config, inputs_embeds, attention_mask=None,
                                     encoder_hidden_states=None, past_key_values=None,
                                     or_mask_function=None, and_mask_function=None, **kwargs):
@@ -77,7 +83,7 @@ def load_dllm():
         # First unload the other model to free VRAM
         unload_ar()
         print("Loading Diffusion LLM (LLaDA2.1-mini) in 4-bit...")
-        _dllm_tokenizer = AutoTokenizer.from_pretrained("inclusionAI/LLaDA2.1-mini")
+        _dllm_tokenizer = AutoTokenizer.from_pretrained("inclusionAI/LLaDA2.1-mini", trust_remote_code=True)
         _dllm_model = AutoModelForCausalLM.from_pretrained(
             "inclusionAI/LLaDA2.1-mini", 
             trust_remote_code=True, 
@@ -98,7 +104,7 @@ def unload_dllm():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-def generate_ar(prompt):
+def generate_ar(prompt, max_new_tokens=MAX_GENERATION_TOKENS):
     load_ar()
 
     messages = [
@@ -108,20 +114,31 @@ def generate_ar(prompt):
 
     inputs = _ar_tokenizer(text_input, return_tensors="pt").to(device)
     input_length = inputs["input_ids"].shape[1]
-    outputs = _ar_model.generate(**inputs, max_new_tokens=512, do_sample=False, temperature=0.0) 
+    outputs = _ar_model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False, temperature=0.0) 
     generated_tokens = outputs[0][input_length:]
     return _ar_tokenizer.decode(generated_tokens, skip_special_tokens=True)
 
-def generate_dllm(prompt):
+def generate_dllm(prompt, gen_length=MAX_GENERATION_TOKENS):
     load_dllm()
-    inputs = _dllm_tokenizer(prompt, return_tensors="pt").to(device)
+    messages = [
+        {"role": "user", "content": prompt}
+    ]
+    input_ids = _dllm_tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_tensors="pt"
+    ).to(device)
     outputs = _dllm_model.generate(
-        inputs=inputs["input_ids"],
-        gen_length=512,
+        inputs=input_ids,
+        gen_length=gen_length,
         block_length=32,
-        threshold=0.5,
-        editing_threshold=0,
+        threshold=LLADA_THRESHOLD,
+        editing_threshold=LLADA_EDITING_THRESHOLD,
+        max_post_steps=LLADA_MAX_POST_STEPS,
         eos_early_stop=True,
-        temperature=0.0
+        temperature=0.0,
+        top_p=None,
+        top_k=None
     )
     return _dllm_tokenizer.decode(outputs[0], skip_special_tokens=True)
