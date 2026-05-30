@@ -1,14 +1,16 @@
-from data import load_all_canitedit_samples
-from utils import extract_python_code, is_degenerate_output
-from permutations import generate_positional_prompts
-from pipeline import generate_ar, generate_dllm, unload_ar, unload_dllm
-from evaluation import calculate_ast_deviation, is_valid_python
-import torch
-import os
 import json
+import os
+
+import torch
+
+from data import load_all_canitedit_samples
+from evaluation import calculate_ast_deviation, is_valid_python
+from permutations import generate_positional_prompts
+from pipeline import MODEL_GROUPS, MODEL_REGISTRY, generate_with_model, unload_all_models
+from utils import extract_python_code, is_degenerate_output
 
 
-CACHE_VERSION = "v2"
+CACHE_VERSION = "v3_multi_model"
 GOLD_CORRECTNESS_THRESHOLD = 0.95
 
 
@@ -83,12 +85,157 @@ def summarize_model(name, metrics, total_samples):
     print(f"  Filtered order-invariance score:           {format_score(filtered_avg)} ({metrics['filtered_pair_count']}/{total_samples} valid/non-degenerate pairs)")
     print(f"  Gold-conditioned order-invariance score:   {format_score(correct_filtered_avg)} ({metrics['correct_pair_count']}/{total_samples} valid/correct pairs)")
 
+
+def merge_metrics(metrics_list):
+    merged = initialize_metrics()
+
+    for metrics in metrics_list:
+        merged["generation_count"] += metrics["generation_count"]
+        merged["valid_count"] += metrics["valid_count"]
+        merged["degenerate_count"] += metrics["degenerate_count"]
+        merged["correct_count"] += metrics["correct_count"]
+        merged["pair_count"] += metrics["pair_count"]
+        merged["filtered_pair_count"] += metrics["filtered_pair_count"]
+        merged["correct_pair_count"] += metrics["correct_pair_count"]
+        merged["gold_scores"].extend(metrics["gold_scores"])
+        merged["raw_invariance_scores"].extend(metrics["raw_invariance_scores"])
+        merged["filtered_invariance_scores"].extend(metrics["filtered_invariance_scores"])
+        merged["correct_filtered_invariance_scores"].extend(metrics["correct_filtered_invariance_scores"])
+
+    return merged
+
+
+def cache_file_for_model(model_key):
+    return f"{model_key}_results_{CACHE_VERSION}.json"
+
+
+def load_results_cache(model_key):
+    results_file = cache_file_for_model(model_key)
+    cache = {}
+
+    if os.path.exists(results_file):
+        try:
+            with open(results_file, "r") as handle:
+                cache = json.load(handle)
+            print(f"Loaded cached results for {MODEL_REGISTRY[model_key]['label']} from {results_file}.")
+        except Exception as error:
+            print(f"Failed to read cache file {results_file}: {error}")
+
+    return results_file, cache
+
+
+def cache_entry_complete(entry):
+    if not entry:
+        return False
+    return bool(entry.get("prefix_output")) and bool(entry.get("suffix_output"))
+
+
+def run_model_inference(model_key, prompts):
+    model_label = MODEL_REGISTRY[model_key]["label"]
+    results_file, results_cache = load_results_cache(model_key)
+    needs_inference = any(not cache_entry_complete(results_cache.get(str(prompt["index"]))) for prompt in prompts)
+
+    results = []
+    if needs_inference:
+        print(f"\n[Inference] Running {model_label} on all samples...")
+        for position, prompt in enumerate(prompts):
+            cache_key = str(prompt["index"])
+            if cache_entry_complete(results_cache.get(cache_key)):
+                cached_result = results_cache[cache_key]
+                results.append({
+                    "index": prompt["index"],
+                    "prefix_output": cached_result["prefix_output"],
+                    "suffix_output": cached_result["suffix_output"],
+                })
+                continue
+
+            print(f"[{position + 1}/{len(prompts)}] Generating {model_label} for sample {prompt['index']}...")
+            try:
+                prefix_output = generate_with_model(model_key, prompt["prefix_prompt"])
+                suffix_output = generate_with_model(model_key, prompt["suffix_prompt"])
+                results.append({
+                    "index": prompt["index"],
+                    "prefix_output": prefix_output,
+                    "suffix_output": suffix_output,
+                })
+                results_cache[cache_key] = {
+                    "prefix_output": prefix_output,
+                    "suffix_output": suffix_output,
+                }
+            except Exception as error:
+                print(f"Error during generation for {model_label} sample {prompt['index']}: {error}")
+                results.append({
+                    "index": prompt["index"],
+                    "prefix_output": "",
+                    "suffix_output": "",
+                })
+
+        try:
+            with open(results_file, "w") as handle:
+                json.dump(results_cache, handle, indent=4)
+            print(f"Saved {model_label} results to cache: {results_file}")
+        except Exception as error:
+            print(f"Failed to write cache file {results_file}: {error}")
+    else:
+        print(f"All {model_label} results loaded from cache. Skipping model execution.")
+        for prompt in prompts:
+            cache_key = str(prompt["index"])
+            results.append({
+                "index": prompt["index"],
+                "prefix_output": results_cache[cache_key]["prefix_output"],
+                "suffix_output": results_cache[cache_key]["suffix_output"],
+            })
+
+    unload_all_models()
+    return results
+
+
+def evaluate_model_results(model_key, samples, model_results):
+    model_label = MODEL_REGISTRY[model_key]["label"]
+    metrics = initialize_metrics()
+
+    print(f"\n=== Results: {model_label} Prefix vs Suffix ===")
+    for index, sample in enumerate(samples):
+        result = model_results[index]
+
+        prefix_eval = evaluate_generation(result["prefix_output"], sample.get("after", ""))
+        suffix_eval = evaluate_generation(result["suffix_output"], sample.get("after", ""))
+
+        for generation in (prefix_eval, suffix_eval):
+            record_generation(metrics, generation)
+
+        metrics["pair_count"] += 1
+
+        raw_score = None
+        if prefix_eval["code"] and suffix_eval["code"]:
+            raw_score = calculate_ast_deviation(prefix_eval["code"], suffix_eval["code"])
+            metrics["raw_invariance_scores"].append(raw_score)
+
+        if prefix_eval["valid"] and suffix_eval["valid"] and not prefix_eval["degenerate"] and not suffix_eval["degenerate"]:
+            filtered_score = calculate_ast_deviation(prefix_eval["code"], suffix_eval["code"])
+            metrics["filtered_invariance_scores"].append(filtered_score)
+            metrics["filtered_pair_count"] += 1
+
+            if prefix_eval["correct"] and suffix_eval["correct"]:
+                metrics["correct_filtered_invariance_scores"].append(filtered_score)
+                metrics["correct_pair_count"] += 1
+
+        print(f"Sample {sample['index']} | {model_label} raw: {format_score(raw_score)}")
+
+    return metrics
+
+
+def average_metric(scores):
+    if not scores:
+        return None
+    return sum(scores) / len(scores)
+
 def main():
-    NUM_SAMPLES = 100
-    print(f"=== Starting RQ2 Order Invariance Experiment on {NUM_SAMPLES} samples ===")
+    num_samples = 100
+    print(f"=== Starting RQ2 Order Invariance Experiment on {num_samples} samples ===")
 
     # 1. Data Loading
-    samples = load_all_canitedit_samples(limit=NUM_SAMPLES)
+    samples = load_all_canitedit_samples(limit=num_samples)
     print(f"Loaded {len(samples)} samples for evaluation.")
     
     # 2. Prompt Generation
@@ -101,231 +248,49 @@ def main():
             "suffix_prompt": suffix_prompt
         })
         
-    # 3. Inference Pipeline (Grouped to avoid model loading/unloading overhead)
-    
-    # Setup cache for Autoregressive Baseline (Qwen2.5)
-    ar_results_file = f"ar_results_{CACHE_VERSION}.json"
-    ar_results_cache = {}
-    if os.path.exists(ar_results_file):
-        try:
-            with open(ar_results_file, "r") as f:
-                ar_results_cache = json.load(f)
-            print(f"Loaded cached AR results from {ar_results_file} (delete this file to force rerun).")
-        except Exception as e:
-            print(f"Failed to read cache file {ar_results_file}: {e}")
+    group_metrics = {}
+    all_model_metrics = []
 
-    # Check if we need to run AR model inference
-    ar_needed = False
-    for p in prompts:
-        idx_str = str(p["index"])
-        if idx_str not in ar_results_cache or not ar_results_cache[idx_str].get("ar_prefix") or not ar_results_cache[idx_str].get("ar_suffix"):
-            ar_needed = True
-            break
+    print("\n=== Model Groups ===")
+    print("AR:")
+    for model_key in MODEL_GROUPS["ar"]:
+        print(f"  - {MODEL_REGISTRY[model_key]['label']}")
+    print("Diffusion:")
+    for model_key in MODEL_GROUPS["diffusion"]:
+        print(f"  - {MODEL_REGISTRY[model_key]['label']}")
 
-    ar_results = []
-    if ar_needed:
-        print("\n[Inference] Running Autoregressive Baseline (Qwen2.5) on all samples...")
-        for idx, p in enumerate(prompts):
-            idx_str = str(p["index"])
-            # Use cached results if available
-            if idx_str in ar_results_cache and ar_results_cache[idx_str].get("ar_prefix") and ar_results_cache[idx_str].get("ar_suffix"):
-                ar_results.append({
-                    "index": p["index"],
-                    "ar_prefix": ar_results_cache[idx_str]["ar_prefix"],
-                    "ar_suffix": ar_results_cache[idx_str]["ar_suffix"]
-                })
-                continue
-                
-            print(f"[{idx+1}/{len(prompts)}] Generating AR for sample {p['index']}...")
-            try:
-                raw_ar_prefix = generate_ar(p["prefix_prompt"])
-                raw_ar_suffix = generate_ar(p["suffix_prompt"])
-                ar_results.append({
-                    "index": p["index"],
-                    "ar_prefix": raw_ar_prefix,
-                    "ar_suffix": raw_ar_suffix
-                })
-                ar_results_cache[idx_str] = {
-                    "ar_prefix": raw_ar_prefix,
-                    "ar_suffix": raw_ar_suffix
-                }
-            except Exception as e:
-                print(f"Error during AR generation for sample {p['index']}: {e}")
-                ar_results.append({
-                    "index": p["index"],
-                    "ar_prefix": "",
-                    "ar_suffix": ""
-                })
-                
-        # Save cache file after running AR
-        try:
-            with open(ar_results_file, "w") as f:
-                json.dump(ar_results_cache, f, indent=4)
-            print(f"Saved AR results to cache: {ar_results_file}")
-        except Exception as e:
-            print(f"Failed to write cache file {ar_results_file}: {e}")
-            
-        # Explicitly unload AR model to free VRAM before loading LLaDA
-        unload_ar()
-    else:
-        print("All AR results loaded from cache. Skipping AR model execution.")
-        for p in prompts:
-            idx_str = str(p["index"])
-            ar_results.append({
-                "index": p["index"],
-                "ar_prefix": ar_results_cache[idx_str]["ar_prefix"],
-                "ar_suffix": ar_results_cache[idx_str]["ar_suffix"]
-            })
-    
-    # Setup cache for Diffusion Baseline (LLaDA)
-    dllm_results_file = f"dllm_results_{CACHE_VERSION}.json"
-    dllm_results_cache = {}
-    if os.path.exists(dllm_results_file):
-        try:
-            with open(dllm_results_file, "r") as f:
-                dllm_results_cache = json.load(f)
-            print(f"Loaded cached LLaDA results from {dllm_results_file} (delete this file to force rerun).")
-        except Exception as e:
-            print(f"Failed to read cache file {dllm_results_file}: {e}")
+    for group_name, model_keys in MODEL_GROUPS.items():
+        print(f"\n=== Running {group_name.upper()} models ===")
+        current_group_metrics = []
 
-    # Check if we need to run LLaDA model inference
-    dllm_needed = False
-    for p in prompts:
-        idx_str = str(p["index"])
-        if idx_str not in dllm_results_cache or not dllm_results_cache[idx_str].get("dllm_prefix") or not dllm_results_cache[idx_str].get("dllm_suffix"):
-            dllm_needed = True
-            break
+        for model_key in model_keys:
+            model_results = run_model_inference(model_key, prompts)
+            model_metrics = evaluate_model_results(model_key, samples, model_results)
+            summarize_model(MODEL_REGISTRY[model_key]["label"], model_metrics, len(samples))
+            current_group_metrics.append(model_metrics)
+            all_model_metrics.append(model_metrics)
 
-    dllm_results = []
-    if dllm_needed:
-        print("\n[Inference] Running Diffusion Baseline (LLaDA) on all samples...")
-        for idx, p in enumerate(prompts):
-            idx_str = str(p["index"])
-            # Use cached results if available
-            if idx_str in dllm_results_cache and dllm_results_cache[idx_str].get("dllm_prefix") and dllm_results_cache[idx_str].get("dllm_suffix"):
-                dllm_results.append({
-                    "index": p["index"],
-                    "dllm_prefix": dllm_results_cache[idx_str]["dllm_prefix"],
-                    "dllm_suffix": dllm_results_cache[idx_str]["dllm_suffix"]
-                })
-                continue
-                
-            print(f"[{idx+1}/{len(prompts)}] Generating LLaDA for sample {p['index']}...")
-            try:
-                raw_dllm_prefix = generate_dllm(p["prefix_prompt"])
-                raw_dllm_suffix = generate_dllm(p["suffix_prompt"])
-                dllm_results.append({
-                    "index": p["index"],
-                    "dllm_prefix": raw_dllm_prefix,
-                    "dllm_suffix": raw_dllm_suffix
-                })
-                dllm_results_cache[idx_str] = {
-                    "dllm_prefix": raw_dllm_prefix,
-                    "dllm_suffix": raw_dllm_suffix
-                }
-            except Exception as e:
-                print(f"Error during LLaDA generation for sample {p['index']}: {e}")
-                dllm_results.append({
-                    "index": p["index"],
-                    "dllm_prefix": "",
-                    "dllm_suffix": ""
-                })
-                
-        # Save cache file after running LLaDA
-        try:
-            with open(dllm_results_file, "w") as f:
-                json.dump(dllm_results_cache, f, indent=4)
-            print(f"Saved LLaDA results to cache: {dllm_results_file}")
-        except Exception as e:
-            print(f"Failed to write cache file {dllm_results_file}: {e}")
-            
-        # Explicitly unload LLaDA model to clean VRAM
-        unload_dllm()
-    else:
-        print("All LLaDA results loaded from cache. Skipping LLaDA model execution.")
-        for p in prompts:
-            idx_str = str(p["index"])
-            dllm_results.append({
-                "index": p["index"],
-                "dllm_prefix": dllm_results_cache[idx_str]["dllm_prefix"],
-                "dllm_suffix": dllm_results_cache[idx_str]["dllm_suffix"]
-            })
-    
-    # 4. Evaluation and Metrics
-    print("\n=== Results: Positional Shift (Prefix vs Suffix) ===")
-    ar_metrics = initialize_metrics()
-    dllm_metrics = initialize_metrics()
-    
-    for i, sample in enumerate(samples):
-        ar_res = ar_results[i]
-        dllm_res = dllm_results[i]
+        group_metrics[group_name] = merge_metrics(current_group_metrics)
+        print(f"\n=== {group_name.upper()} Group Average ({len(model_keys)} models) ===")
+        summarize_model(f"{group_name.upper()} Group", group_metrics[group_name], len(samples) * len(model_keys))
 
-        ar_prefix = evaluate_generation(ar_res["ar_prefix"], sample.get("after", ""))
-        ar_suffix = evaluate_generation(ar_res["ar_suffix"], sample.get("after", ""))
-        dllm_prefix = evaluate_generation(dllm_res["dllm_prefix"], sample.get("after", ""))
-        dllm_suffix = evaluate_generation(dllm_res["dllm_suffix"], sample.get("after", ""))
+    overall_metrics = merge_metrics(all_model_metrics)
+    print(f"\n=== All Models Combined ({len(all_model_metrics)} models) ===")
+    summarize_model("All Models", overall_metrics, len(samples) * len(all_model_metrics))
 
-        for generation in (ar_prefix, ar_suffix):
-            record_generation(ar_metrics, generation)
-
-        for generation in (dllm_prefix, dllm_suffix):
-            record_generation(dllm_metrics, generation)
-
-        ar_metrics["pair_count"] += 1
-        dllm_metrics["pair_count"] += 1
-
-        ar_raw_score = None
-        if ar_prefix["code"] and ar_suffix["code"]:
-            ar_raw_score = calculate_ast_deviation(ar_prefix["code"], ar_suffix["code"])
-            ar_metrics["raw_invariance_scores"].append(ar_raw_score)
-
-        if ar_prefix["valid"] and ar_suffix["valid"] and not ar_prefix["degenerate"] and not ar_suffix["degenerate"]:
-            ar_filtered_score = calculate_ast_deviation(ar_prefix["code"], ar_suffix["code"])
-            ar_metrics["filtered_invariance_scores"].append(ar_filtered_score)
-            ar_metrics["filtered_pair_count"] += 1
-
-            if ar_prefix["correct"] and ar_suffix["correct"]:
-                ar_metrics["correct_filtered_invariance_scores"].append(ar_filtered_score)
-                ar_metrics["correct_pair_count"] += 1
-
-        dllm_raw_score = None
-        if dllm_prefix["code"] and dllm_suffix["code"]:
-            dllm_raw_score = calculate_ast_deviation(dllm_prefix["code"], dllm_suffix["code"])
-            dllm_metrics["raw_invariance_scores"].append(dllm_raw_score)
-
-        if dllm_prefix["valid"] and dllm_suffix["valid"] and not dllm_prefix["degenerate"] and not dllm_suffix["degenerate"]:
-            dllm_filtered_score = calculate_ast_deviation(dllm_prefix["code"], dllm_suffix["code"])
-            dllm_metrics["filtered_invariance_scores"].append(dllm_filtered_score)
-            dllm_metrics["filtered_pair_count"] += 1
-
-            if dllm_prefix["correct"] and dllm_suffix["correct"]:
-                dllm_metrics["correct_filtered_invariance_scores"].append(dllm_filtered_score)
-                dllm_metrics["correct_pair_count"] += 1
-
-        print(
-            f"Sample {sample['index']} | "
-            f"AR raw: {format_score(ar_raw_score)} | "
-            f"LLaDA raw: {format_score(dllm_raw_score)}"
-        )
-
-    print(f"\n=== Final Aggregated Results ({len(samples)} total samples) ===")
-    summarize_model("AR Model (Qwen)", ar_metrics, len(samples))
-    summarize_model("dLLM (LLaDA)", dllm_metrics, len(samples))
+    ar_group = group_metrics["ar"]
+    diffusion_group = group_metrics["diffusion"]
 
     filtered_bias_gap = None
-    ar_filtered_scores = ar_metrics["filtered_invariance_scores"]
-    dllm_filtered_scores = dllm_metrics["filtered_invariance_scores"]
-    if ar_filtered_scores and dllm_filtered_scores:
-        filtered_bias_gap = (sum(dllm_filtered_scores) / len(dllm_filtered_scores)) - (sum(ar_filtered_scores) / len(ar_filtered_scores))
+    if ar_group["filtered_invariance_scores"] and diffusion_group["filtered_invariance_scores"]:
+        filtered_bias_gap = average_metric(diffusion_group["filtered_invariance_scores"]) - average_metric(ar_group["filtered_invariance_scores"])
 
     correct_bias_gap = None
-    ar_correct_scores = ar_metrics["correct_filtered_invariance_scores"]
-    dllm_correct_scores = dllm_metrics["correct_filtered_invariance_scores"]
-    if ar_correct_scores and dllm_correct_scores:
-        correct_bias_gap = (sum(dllm_correct_scores) / len(dllm_correct_scores)) - (sum(ar_correct_scores) / len(ar_correct_scores))
+    if ar_group["correct_filtered_invariance_scores"] and diffusion_group["correct_filtered_invariance_scores"]:
+        correct_bias_gap = average_metric(diffusion_group["correct_filtered_invariance_scores"]) - average_metric(ar_group["correct_filtered_invariance_scores"])
 
-    print(f"\nFiltered Recency Bias Gap (dLLM vs AR):          {format_score(filtered_bias_gap)}")
-    print(f"Gold-Conditioned Bias Gap (dLLM vs AR):          {format_score(correct_bias_gap)}")
+    print(f"\nFiltered Recency Bias Gap (Diffusion vs AR groups): {format_score(filtered_bias_gap)}")
+    print(f"Gold-Conditioned Bias Gap (Diffusion vs AR groups): {format_score(correct_bias_gap)}")
 
 if __name__ == "__main__":
     if torch.cuda.is_available():
