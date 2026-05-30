@@ -68,7 +68,7 @@ sympy==1.14.0
 tokenizers==0.22.2
 torch==2.11.0
 tqdm==4.67.3
-transformers==5.8.0
+transformers==5.9.0
 tree-sitter==0.25.2
 tree-sitter-python==0.25.0
 triton==3.6.0
@@ -79,3 +79,4 @@ urllib3==2.7.0
 xxhash==3.7.0
 yarl==1.23.0
 zss==1.2.0
+bitsandbytes
