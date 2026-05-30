@@ -54,7 +54,11 @@ MODEL_REGISTRY = {
             "enable_thinking": False,
         },
         "generation_kwargs": {
-            "do_sample": False,
+            "do_sample": True,
+            "temperature": 0.7,
+            "top_p": 0.8,
+            "top_k": 20,
+            "min_p": 0.0,
         },
     },
     "llada21_mini": {
@@ -63,7 +67,7 @@ MODEL_REGISTRY = {
         "family": "llada21",
         "model_id": "inclusionAI/LLaDA2.1-mini",
         "trust_remote_code": True,
-        "quantized": False,
+        "quantized": True,
         "chat_template_kwargs": {},
     },
     "llada_8b_instruct": {
@@ -72,7 +76,7 @@ MODEL_REGISTRY = {
         "family": "llada8b",
         "model_id": "GSAI-ML/LLaDA-8B-Instruct",
         "trust_remote_code": True,
-        "quantized": False,
+        "quantized": True,
         "chat_template_kwargs": {},
     },
     "diffucoder_7b": {
@@ -81,7 +85,7 @@ MODEL_REGISTRY = {
         "family": "diffucoder",
         "model_id": "apple/DiffuCoder-7B-cpGRPO",
         "trust_remote_code": True,
-        "quantized": False,
+        "quantized": True,
         "chat_template_kwargs": {},
     },
 }
@@ -142,6 +146,18 @@ def _model_load_class(spec):
     return AutoModelForCausalLM
 
 
+def _build_model_kwargs(spec, use_quantization):
+    model_kwargs = {
+        "device_map": "auto",
+        "torch_dtype": _get_dense_dtype(),
+    }
+    if spec["trust_remote_code"]:
+        model_kwargs["trust_remote_code"] = True
+    if use_quantization and quantization_config is not None:
+        model_kwargs["quantization_config"] = quantization_config
+    return model_kwargs
+
+
 def _load_model(model_key):
     global _loaded_model_key, _loaded_model, _loaded_tokenizer
 
@@ -159,16 +175,19 @@ def _load_model(model_key):
         tokenizer_kwargs["trust_remote_code"] = True
     tokenizer = AutoTokenizer.from_pretrained(spec["model_id"], **tokenizer_kwargs)
 
-    model_kwargs = {
-        "device_map": "auto",
-        "torch_dtype": _get_dense_dtype(),
-    }
-    if spec["trust_remote_code"]:
-        model_kwargs["trust_remote_code"] = True
-    if spec["quantized"] and quantization_config is not None:
-        model_kwargs["quantization_config"] = quantization_config
+    model = None
+    wants_quantization = spec["quantized"] and quantization_config is not None
+    if wants_quantization:
+        try:
+            model = load_class.from_pretrained(spec["model_id"], **_build_model_kwargs(spec, use_quantization=True))
+            print(f"Loaded {spec['label']} with 4-bit quantization.")
+        except Exception as error:
+            print(f"4-bit load failed for {spec['label']}: {error}")
+            print(f"Falling back to {_get_dense_dtype()} weights for {spec['label']}.")
 
-    model = load_class.from_pretrained(spec["model_id"], **model_kwargs)
+    if model is None:
+        model = load_class.from_pretrained(spec["model_id"], **_build_model_kwargs(spec, use_quantization=False))
+
     model.eval()
 
     if model_key == "llada_8b_instruct" and tokenizer.padding_side != "left":
