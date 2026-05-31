@@ -92,7 +92,7 @@ MODEL_REGISTRY = {
 
 MODEL_GROUPS = {
     "ar": ["qwen25_coder", "deepseek_coder", "qwen3_8b"],
-    "diffusion": ["llada21_mini", "llada_8b_instruct", "diffucoder_7b"],
+    "diffusion": ["llada_8b_instruct", "diffucoder_7b", "llada21_mini"],
 }
 
 

@@ -1,5 +1,6 @@
 import json
 import os
+import time
 
 import torch
 
@@ -64,6 +65,17 @@ def record_generation(metrics, generation):
 
 def format_score(score):
     return f"{score:.4f}" if score is not None else "n/a"
+
+
+def format_duration(seconds):
+    minutes, remaining_seconds = divmod(seconds, 60)
+    hours, minutes = divmod(int(minutes), 60)
+
+    if hours > 0:
+        return f"{hours:d}h {minutes:02d}m {remaining_seconds:05.2f}s"
+    if minutes > 0:
+        return f"{minutes:d}m {remaining_seconds:05.2f}s"
+    return f"{remaining_seconds:.2f}s"
 
 
 def summarize_model(name, metrics, total_samples):
@@ -132,6 +144,7 @@ def cache_entry_complete(entry):
 
 def run_model_inference(model_key, prompts):
     model_label = MODEL_REGISTRY[model_key]["label"]
+    start_time = time.perf_counter()
     results_file, results_cache = load_results_cache(model_key)
     needs_inference = any(not cache_entry_complete(results_cache.get(str(prompt["index"]))) for prompt in prompts)
 
@@ -187,7 +200,9 @@ def run_model_inference(model_key, prompts):
             })
 
     unload_all_models()
-    return results
+    elapsed_seconds = time.perf_counter() - start_time
+    print(f"Total runtime for {model_label}: {format_duration(elapsed_seconds)}")
+    return results, elapsed_seconds
 
 
 def evaluate_model_results(model_key, samples, model_results):
@@ -250,6 +265,7 @@ def main():
         
     group_metrics = {}
     all_model_metrics = []
+    model_timings = {}
 
     print("\n=== Model Groups ===")
     print("AR:")
@@ -264,19 +280,27 @@ def main():
         current_group_metrics = []
 
         for model_key in model_keys:
-            model_results = run_model_inference(model_key, prompts)
+            model_results, elapsed_seconds = run_model_inference(model_key, prompts)
+            model_timings[model_key] = elapsed_seconds
             model_metrics = evaluate_model_results(model_key, samples, model_results)
             summarize_model(MODEL_REGISTRY[model_key]["label"], model_metrics, len(samples))
+            print(f"  Total runtime:                             {format_duration(elapsed_seconds)}")
             current_group_metrics.append(model_metrics)
             all_model_metrics.append(model_metrics)
 
         group_metrics[group_name] = merge_metrics(current_group_metrics)
         print(f"\n=== {group_name.upper()} Group Average ({len(model_keys)} models) ===")
         summarize_model(f"{group_name.upper()} Group", group_metrics[group_name], len(samples) * len(model_keys))
+        group_runtime = sum(model_timings[model_key] for model_key in model_keys)
+        average_group_runtime = group_runtime / len(model_keys)
+        print(f"  Total group runtime:                       {format_duration(group_runtime)}")
+        print(f"  Average model runtime:                     {format_duration(average_group_runtime)}")
 
     overall_metrics = merge_metrics(all_model_metrics)
     print(f"\n=== All Models Combined ({len(all_model_metrics)} models) ===")
     summarize_model("All Models", overall_metrics, len(samples) * len(all_model_metrics))
+    total_runtime = sum(model_timings.values())
+    print(f"  Total experiment runtime:                  {format_duration(total_runtime)}")
 
     ar_group = group_metrics["ar"]
     diffusion_group = group_metrics["diffusion"]
@@ -288,6 +312,12 @@ def main():
     correct_bias_gap = None
     if ar_group["correct_filtered_invariance_scores"] and diffusion_group["correct_filtered_invariance_scores"]:
         correct_bias_gap = average_metric(diffusion_group["correct_filtered_invariance_scores"]) - average_metric(ar_group["correct_filtered_invariance_scores"])
+
+    print("\n=== Model Runtime Summary ===")
+    for group_name, model_keys in MODEL_GROUPS.items():
+        print(f"{group_name.upper()}:")
+        for model_key in model_keys:
+            print(f"  {MODEL_REGISTRY[model_key]['label']}: {format_duration(model_timings[model_key])}")
 
     print(f"\nFiltered Recency Bias Gap (Diffusion vs AR groups): {format_score(filtered_bias_gap)}")
     print(f"Gold-Conditioned Bias Gap (Diffusion vs AR groups): {format_score(correct_bias_gap)}")
