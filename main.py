@@ -13,6 +13,7 @@ from utils import extract_python_code, is_degenerate_output
 
 CACHE_VERSION = "v3_multi_model"
 GOLD_CORRECTNESS_THRESHOLD = 0.95
+CACHE_DIR = "cache_artifacts"
 
 
 def initialize_metrics():
@@ -117,12 +118,18 @@ def merge_metrics(metrics_list):
     return merged
 
 
+def ensure_cache_dir():
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+
 def cache_file_for_model(model_key):
-    return f"{model_key}_results_{CACHE_VERSION}.json"
+    ensure_cache_dir()
+    return os.path.join(CACHE_DIR, f"{model_key}_results_{CACHE_VERSION}.json")
 
 
 def evaluation_cache_file_for_model(model_key):
-    return f"{model_key}_metrics_{CACHE_VERSION}.json"
+    ensure_cache_dir()
+    return os.path.join(CACHE_DIR, f"{model_key}_metrics_{CACHE_VERSION}.json")
 
 
 def load_results_cache(model_key):
