@@ -121,6 +121,10 @@ def cache_file_for_model(model_key):
     return f"{model_key}_results_{CACHE_VERSION}.json"
 
 
+def evaluation_cache_file_for_model(model_key):
+    return f"{model_key}_metrics_{CACHE_VERSION}.json"
+
+
 def load_results_cache(model_key):
     results_file = cache_file_for_model(model_key)
     cache = {}
@@ -136,10 +140,40 @@ def load_results_cache(model_key):
     return results_file, cache
 
 
+def load_evaluation_cache(model_key):
+    metrics_file = evaluation_cache_file_for_model(model_key)
+    cache = {}
+
+    if os.path.exists(metrics_file):
+        try:
+            with open(metrics_file, "r") as handle:
+                cache = json.load(handle)
+            print(f"Loaded cached evaluation metrics for {MODEL_REGISTRY[model_key]['label']} from {metrics_file}.")
+        except Exception as error:
+            print(f"Failed to read evaluation cache file {metrics_file}: {error}")
+
+    return metrics_file, cache
+
+
 def cache_entry_complete(entry):
     if not entry:
         return False
     return bool(entry.get("prefix_output")) and bool(entry.get("suffix_output"))
+
+
+def metrics_cache_complete(cache, total_samples):
+    required_keys = set(initialize_metrics().keys())
+    return bool(cache) and required_keys.issubset(cache.keys()) and cache.get("pair_count") == total_samples
+
+
+def save_evaluation_cache(model_key, metrics):
+    metrics_file = evaluation_cache_file_for_model(model_key)
+    try:
+        with open(metrics_file, "w") as handle:
+            json.dump(metrics, handle, indent=4)
+        print(f"Saved evaluation metrics for {MODEL_REGISTRY[model_key]['label']} to cache: {metrics_file}")
+    except Exception as error:
+        print(f"Failed to write evaluation cache file {metrics_file}: {error}")
 
 
 def run_model_inference(model_key, prompts):
@@ -240,6 +274,17 @@ def evaluate_model_results(model_key, samples, model_results):
     return metrics
 
 
+def get_or_evaluate_model_results(model_key, samples, model_results):
+    _, metrics_cache = load_evaluation_cache(model_key)
+    if metrics_cache_complete(metrics_cache, len(samples)):
+        print(f"Skipping evaluation for {MODEL_REGISTRY[model_key]['label']}; cached metrics are complete.")
+        return metrics_cache
+
+    metrics = evaluate_model_results(model_key, samples, model_results)
+    save_evaluation_cache(model_key, metrics)
+    return metrics
+
+
 def average_metric(scores):
     if not scores:
         return None
@@ -282,7 +327,7 @@ def main():
         for model_key in model_keys:
             model_results, elapsed_seconds = run_model_inference(model_key, prompts)
             model_timings[model_key] = elapsed_seconds
-            model_metrics = evaluate_model_results(model_key, samples, model_results)
+            model_metrics = get_or_evaluate_model_results(model_key, samples, model_results)
             summarize_model(MODEL_REGISTRY[model_key]["label"], model_metrics, len(samples))
             print(f"  Total runtime:                             {format_duration(elapsed_seconds)}")
             current_group_metrics.append(model_metrics)
