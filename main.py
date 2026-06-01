@@ -7,7 +7,7 @@ import torch
 from data import load_all_canitedit_samples
 from evaluation import calculate_ast_deviation, is_valid_python
 from permutations import generate_positional_prompts
-from pipeline import MODEL_GROUPS, MODEL_REGISTRY, generate_with_model, unload_all_models
+from pipeline import MODEL_GROUPS, MODEL_REGISTRY, generate_batch_with_model, generate_with_model, get_model_batch_size, unload_all_models
 from utils import extract_python_code, is_degenerate_output
 
 
@@ -185,44 +185,50 @@ def save_evaluation_cache(model_key, metrics):
 
 def run_model_inference(model_key, prompts):
     model_label = MODEL_REGISTRY[model_key]["label"]
+    batch_size = get_model_batch_size(model_key)
     start_time = time.perf_counter()
     results_file, results_cache = load_results_cache(model_key)
     needs_inference = any(not cache_entry_complete(results_cache.get(str(prompt["index"]))) for prompt in prompts)
 
     results = []
     if needs_inference:
-        print(f"\n[Inference] Running {model_label} on all samples...")
-        for position, prompt in enumerate(prompts):
-            cache_key = str(prompt["index"])
-            if cache_entry_complete(results_cache.get(cache_key)):
-                cached_result = results_cache[cache_key]
-                results.append({
-                    "index": prompt["index"],
-                    "prefix_output": cached_result["prefix_output"],
-                    "suffix_output": cached_result["suffix_output"],
-                })
-                continue
+        print(f"\n[Inference] Running {model_label} on all samples with batch size {batch_size}...")
+        missing_prompts = [prompt for prompt in prompts if not cache_entry_complete(results_cache.get(str(prompt["index"])))]
 
-            print(f"[{position + 1}/{len(prompts)}] Generating {model_label} for sample {prompt['index']}...")
+        for start_index in range(0, len(missing_prompts), batch_size):
+            batch = missing_prompts[start_index:start_index + batch_size]
+            batch_range = f"{start_index + 1}-{start_index + len(batch)}"
+            batch_indices = ", ".join(str(prompt["index"]) for prompt in batch)
+            print(f"[{batch_range}/{len(missing_prompts)}] Generating {model_label} for samples: {batch_indices}")
+
             try:
-                prefix_output = generate_with_model(model_key, prompt["prefix_prompt"])
-                suffix_output = generate_with_model(model_key, prompt["suffix_prompt"])
-                results.append({
-                    "index": prompt["index"],
-                    "prefix_output": prefix_output,
-                    "suffix_output": suffix_output,
-                })
-                results_cache[cache_key] = {
+                prefix_outputs = generate_batch_with_model(
+                    model_key,
+                    [prompt["prefix_prompt"] for prompt in batch],
+                )
+                suffix_outputs = generate_batch_with_model(
+                    model_key,
+                    [prompt["suffix_prompt"] for prompt in batch],
+                )
+            except Exception as error:
+                print(f"Batch generation failed for {model_label} samples {batch_indices}: {error}")
+                print(f"Retrying {model_label} batch samples one-by-one.")
+                prefix_outputs = []
+                suffix_outputs = []
+                for prompt in batch:
+                    try:
+                        prefix_outputs.append(generate_with_model(model_key, prompt["prefix_prompt"]))
+                        suffix_outputs.append(generate_with_model(model_key, prompt["suffix_prompt"]))
+                    except Exception as single_error:
+                        print(f"Error during generation for {model_label} sample {prompt['index']}: {single_error}")
+                        prefix_outputs.append("")
+                        suffix_outputs.append("")
+
+            for prompt, prefix_output, suffix_output in zip(batch, prefix_outputs, suffix_outputs):
+                results_cache[str(prompt["index"])] = {
                     "prefix_output": prefix_output,
                     "suffix_output": suffix_output,
                 }
-            except Exception as error:
-                print(f"Error during generation for {model_label} sample {prompt['index']}: {error}")
-                results.append({
-                    "index": prompt["index"],
-                    "prefix_output": "",
-                    "suffix_output": "",
-                })
 
         try:
             with open(results_file, "w") as handle:
@@ -232,13 +238,15 @@ def run_model_inference(model_key, prompts):
             print(f"Failed to write cache file {results_file}: {error}")
     else:
         print(f"All {model_label} results loaded from cache. Skipping model execution.")
-        for prompt in prompts:
-            cache_key = str(prompt["index"])
-            results.append({
-                "index": prompt["index"],
-                "prefix_output": results_cache[cache_key]["prefix_output"],
-                "suffix_output": results_cache[cache_key]["suffix_output"],
-            })
+
+    for prompt in prompts:
+        cache_key = str(prompt["index"])
+        cached_result = results_cache.get(cache_key, {})
+        results.append({
+            "index": prompt["index"],
+            "prefix_output": cached_result.get("prefix_output", ""),
+            "suffix_output": cached_result.get("suffix_output", ""),
+        })
 
     unload_all_models()
     elapsed_seconds = time.perf_counter() - start_time

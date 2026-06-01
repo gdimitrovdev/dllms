@@ -27,6 +27,7 @@ MODEL_REGISTRY = {
         "model_id": "Qwen/Qwen2.5-Coder-7B-Instruct",
         "trust_remote_code": False,
         "quantized": True,
+        "batch_size": 8,
         "chat_template_kwargs": {},
         "generation_kwargs": {
             "do_sample": False,
@@ -39,6 +40,7 @@ MODEL_REGISTRY = {
         "model_id": "deepseek-ai/deepseek-coder-6.7b-instruct",
         "trust_remote_code": True,
         "quantized": True,
+        "batch_size": 8,
         "chat_template_kwargs": {},
         "generation_kwargs": {
             "do_sample": False,
@@ -51,6 +53,7 @@ MODEL_REGISTRY = {
         "model_id": "Qwen/Qwen3-8B",
         "trust_remote_code": False,
         "quantized": True,
+        "batch_size": 8,
         "chat_template_kwargs": {
             "enable_thinking": False,
         },
@@ -69,6 +72,7 @@ MODEL_REGISTRY = {
         "model_id": "inclusionAI/LLaDA2.1-mini",
         "trust_remote_code": True,
         "quantized": True,
+        "batch_size": 4,
         "chat_template_kwargs": {},
     },
     "llada_8b_instruct": {
@@ -78,6 +82,7 @@ MODEL_REGISTRY = {
         "model_id": "GSAI-ML/LLaDA-8B-Instruct",
         "trust_remote_code": True,
         "quantized": False,
+        "batch_size": 1,
         "chat_template_kwargs": {},
     },
     "diffucoder_7b": {
@@ -87,6 +92,7 @@ MODEL_REGISTRY = {
         "model_id": "apple/DiffuCoder-7B-cpGRPO",
         "trust_remote_code": True,
         "quantized": False,
+        "batch_size": 1,
         "chat_template_kwargs": {},
     },
 }
@@ -183,6 +189,11 @@ def _load_model(model_key):
         tokenizer_kwargs["trust_remote_code"] = True
     tokenizer = AutoTokenizer.from_pretrained(spec["model_id"], **tokenizer_kwargs)
 
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.padding_side != "left":
+        tokenizer.padding_side = "left"
+
     model = None
     wants_quantization = spec["quantized"] and quantization_config is not None
     if wants_quantization:
@@ -249,12 +260,18 @@ def _build_prompt_text(tokenizer, spec, prompt):
 
 
 def _encode_prompt(model_key, prompt, add_special_tokens=True):
+    model, tokenizer, encoded = _encode_prompts(model_key, [prompt], add_special_tokens=add_special_tokens)
+    return model, tokenizer, {name: tensor[:1] for name, tensor in encoded.items()}
+
+
+def _encode_prompts(model_key, prompts, add_special_tokens=True):
     model, tokenizer = _load_model(model_key)
     spec = MODEL_REGISTRY[model_key]
-    prompt_text = _build_prompt_text(tokenizer, spec, prompt)
+    prompt_text = [_build_prompt_text(tokenizer, spec, prompt) for prompt in prompts]
     encoded = tokenizer(
         prompt_text,
         return_tensors="pt",
+        padding=True,
         add_special_tokens=add_special_tokens,
     )
     encoded = {name: tensor.to(device) for name, tensor in encoded.items()}
@@ -262,7 +279,11 @@ def _encode_prompt(model_key, prompt, add_special_tokens=True):
 
 
 def _generate_causal_lm(model_key, prompt, max_new_tokens=MAX_GENERATION_TOKENS):
-    model, tokenizer, encoded = _encode_prompt(model_key, prompt)
+    return _generate_causal_lm_batch(model_key, [prompt], max_new_tokens=max_new_tokens)[0]
+
+
+def _generate_causal_lm_batch(model_key, prompts, max_new_tokens=MAX_GENERATION_TOKENS):
+    model, tokenizer, encoded = _encode_prompts(model_key, prompts)
     input_length = encoded["input_ids"].shape[1]
     generation_kwargs = dict(MODEL_REGISTRY[model_key].get("generation_kwargs", {}))
     generation_kwargs.update({
@@ -274,12 +295,16 @@ def _generate_causal_lm(model_key, prompt, max_new_tokens=MAX_GENERATION_TOKENS)
         generation_kwargs["eos_token_id"] = tokenizer.eos_token_id
 
     outputs = model.generate(**encoded, **generation_kwargs)
-    generated_tokens = outputs[0][input_length:]
-    return tokenizer.decode(generated_tokens, skip_special_tokens=True)
+    generated_tokens = outputs[:, input_length:]
+    return tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
 
 
 def _generate_llada21(prompt, gen_length=MAX_GENERATION_TOKENS):
-    model, tokenizer, encoded = _encode_prompt("llada21_mini", prompt)
+    return _generate_llada21_batch([prompt], gen_length=gen_length)[0]
+
+
+def _generate_llada21_batch(prompts, gen_length=MAX_GENERATION_TOKENS):
+    model, tokenizer, encoded = _encode_prompts("llada21_mini", prompts)
     outputs = model.generate(
         inputs=encoded["input_ids"],
         gen_length=gen_length,
@@ -292,7 +317,8 @@ def _generate_llada21(prompt, gen_length=MAX_GENERATION_TOKENS):
         top_p=None,
         top_k=None,
     )
-    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+    decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+    return [text.strip() for text in decoded]
 
 
 def _llada8b_add_gumbel_noise(logits, temperature):
@@ -381,7 +407,11 @@ def _llada8b_generate(model, prompt_ids, attention_mask=None, steps=MAX_GENERATI
 
 
 def _generate_llada8b(prompt, gen_length=MAX_GENERATION_TOKENS):
-    model, tokenizer, encoded = _encode_prompt("llada_8b_instruct", prompt, add_special_tokens=False)
+    return _generate_llada8b_batch([prompt], gen_length=gen_length)[0]
+
+
+def _generate_llada8b_batch(prompts, gen_length=MAX_GENERATION_TOKENS):
+    model, tokenizer, encoded = _encode_prompts("llada_8b_instruct", prompts, add_special_tokens=False)
     outputs = _llada8b_generate(
         model,
         encoded["input_ids"],
@@ -393,11 +423,15 @@ def _generate_llada8b(prompt, gen_length=MAX_GENERATION_TOKENS):
     )
     generated_tokens = outputs[:, encoded["input_ids"].shape[1]:]
     decoded = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
-    return decoded[0].strip()
+    return [text.strip() for text in decoded]
 
 
 def _generate_diffucoder(prompt, gen_length=MAX_GENERATION_TOKENS):
-    model, tokenizer, encoded = _encode_prompt("diffucoder_7b", prompt)
+    return _generate_diffucoder_batch([prompt], gen_length=gen_length)[0]
+
+
+def _generate_diffucoder_batch(prompts, gen_length=MAX_GENERATION_TOKENS):
+    model, tokenizer, encoded = _encode_prompts("diffucoder_7b", prompts)
     input_length = encoded["input_ids"].shape[1]
     outputs = model.diffusion_generate(
         encoded["input_ids"],
@@ -411,21 +445,29 @@ def _generate_diffucoder(prompt, gen_length=MAX_GENERATION_TOKENS):
         alg="entropy",
         alg_temp=0.0,
     )
-    generated_tokens = outputs.sequences[0][input_length:]
-    decoded = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-    return decoded.split("<|dlm_pad|>")[0].strip()
+    generated_tokens = outputs.sequences[:, input_length:]
+    decoded = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+    return [text.split("<|dlm_pad|>")[0].strip() for text in decoded]
 
 
-def generate_with_model(model_key, prompt, max_new_tokens=MAX_GENERATION_TOKENS):
+def get_model_batch_size(model_key):
+    return MODEL_REGISTRY[model_key].get("batch_size", 1)
+
+
+def generate_batch_with_model(model_key, prompts, max_new_tokens=MAX_GENERATION_TOKENS):
     family = MODEL_REGISTRY[model_key]["family"]
 
     if family == "chat_causal_lm":
-        return _generate_causal_lm(model_key, prompt, max_new_tokens=max_new_tokens)
+        return _generate_causal_lm_batch(model_key, prompts, max_new_tokens=max_new_tokens)
     if family == "llada21":
-        return _generate_llada21(prompt, gen_length=max_new_tokens)
+        return _generate_llada21_batch(prompts, gen_length=max_new_tokens)
     if family == "llada8b":
-        return _generate_llada8b(prompt, gen_length=max_new_tokens)
+        return _generate_llada8b_batch(prompts, gen_length=max_new_tokens)
     if family == "diffucoder":
-        return _generate_diffucoder(prompt, gen_length=max_new_tokens)
+        return _generate_diffucoder_batch(prompts, gen_length=max_new_tokens)
 
     raise ValueError(f"Unsupported model family: {family}")
+
+
+def generate_with_model(model_key, prompt, max_new_tokens=MAX_GENERATION_TOKENS):
+    return generate_batch_with_model(model_key, [prompt], max_new_tokens=max_new_tokens)[0]
