@@ -250,6 +250,32 @@ def _build_prompt_text(tokenizer, spec, prompt):
             "<|im_start|>assistant\n"
         )
 
+    if spec["model_id"] == "deepseek-ai/deepseek-coder-6.7b-instruct":
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Return only the full edited Python program. "
+                    "Do not include markdown fences, explanations, notebook tags, or any text before or after the code. "
+                    "Start directly with Python code and output the final program only."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"{prompt.strip()}\n\n"
+                    "Respond with Python code only. "
+                    "No markdown fences. No explanation. No surrounding prose."
+                ),
+            },
+        ]
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            **spec.get("chat_template_kwargs", {}),
+        )
+
     messages = [{"role": "user", "content": prompt}]
     return tokenizer.apply_chat_template(
         messages,
