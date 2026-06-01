@@ -214,6 +214,8 @@ def _load_model(model_key):
 
     if model_key == "llada_8b_instruct" and tokenizer.padding_side != "left":
         tokenizer.padding_side = "left"
+    if model_key == "llada_8b_instruct" and tokenizer.pad_token_id == LLADA8B_MASK_ID:
+        raise ValueError("LLaDA-8B pad_token_id matches the mask token id; upstream generation code requires a different pad token.")
 
     _loaded_model_key = model_key
     _loaded_model = model
@@ -293,15 +295,21 @@ def _encode_prompts(model_key, prompts, add_special_tokens=True):
     spec = MODEL_REGISTRY[model_key]
 
     if spec["family"] == "llada8b":
-        conversations = [_build_messages(spec, prompt) for prompt in prompts]
-        encoded = tokenizer.apply_chat_template(
-            conversations,
-            tokenize=True,
-            add_generation_prompt=True,
+        messages = [{"role": "user", "content": prompt} for prompt in prompts]
+        prompt_text = [
+            tokenizer.apply_chat_template(
+                [message],
+                tokenize=False,
+                add_generation_prompt=True,
+                **spec.get("chat_template_kwargs", {}),
+            )
+            for message in messages
+        ]
+        encoded = tokenizer(
+            prompt_text,
             return_tensors="pt",
-            return_dict=True,
             padding=True,
-            **spec.get("chat_template_kwargs", {}),
+            add_special_tokens=False,
         )
     else:
         prompt_text = [_build_prompt_text(tokenizer, spec, prompt) for prompt in prompts]
