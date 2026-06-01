@@ -86,7 +86,7 @@ MODEL_REGISTRY = {
         "family": "diffucoder",
         "model_id": "apple/DiffuCoder-7B-cpGRPO",
         "trust_remote_code": True,
-        "quantized": True,
+        "quantized": False,
         "chat_template_kwargs": {},
     },
 }
@@ -156,7 +156,7 @@ def _build_model_kwargs(spec, use_quantization):
         "torch_dtype": _get_dense_dtype(),
     }
 
-    if spec["family"] != "llada8b":
+    if spec["family"] not in {"llada8b", "diffucoder"}:
         model_kwargs["device_map"] = "auto"
 
     if spec["trust_remote_code"]:
@@ -196,7 +196,7 @@ def _load_model(model_key):
     if model is None:
         model = load_class.from_pretrained(spec["model_id"], **_build_model_kwargs(spec, use_quantization=False))
 
-    if spec["family"] == "llada8b" and device != "cpu":
+    if spec["family"] in {"llada8b", "diffucoder"} and device != "cpu":
         model = model.to(device)
 
     model.eval()
@@ -229,6 +229,16 @@ def unload_all_models():
 
 
 def _build_prompt_text(tokenizer, spec, prompt):
+    if spec["family"] == "diffucoder":
+        return (
+            "<|im_start|>system\n"
+            "You are a software engineer. Keep the solutions concise and focused.<|im_end|>\n"
+            "<|im_start|>user\n"
+            f"{prompt.strip()}\n"
+            "<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+
     messages = [{"role": "user", "content": prompt}]
     return tokenizer.apply_chat_template(
         messages,
