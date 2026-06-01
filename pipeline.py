@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 import transformers
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers.modeling_utils import PreTrainedModel
 
 
 MAX_GENERATION_TOKENS = 512
@@ -76,7 +77,7 @@ MODEL_REGISTRY = {
         "family": "llada8b",
         "model_id": "GSAI-ML/LLaDA-8B-Instruct",
         "trust_remote_code": True,
-        "quantized": True,
+        "quantized": False,
         "chat_template_kwargs": {},
     },
     "diffucoder_7b": {
@@ -117,6 +118,10 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
 
 
+if not hasattr(PreTrainedModel, "all_tied_weights_keys"):
+    PreTrainedModel.all_tied_weights_keys = []
+
+
 def _get_dense_dtype():
     if device == "cpu":
         return torch.float32
@@ -148,9 +153,12 @@ def _model_load_class(spec):
 
 def _build_model_kwargs(spec, use_quantization):
     model_kwargs = {
-        "device_map": "auto",
         "torch_dtype": _get_dense_dtype(),
     }
+
+    if spec["family"] != "llada8b":
+        model_kwargs["device_map"] = "auto"
+
     if spec["trust_remote_code"]:
         model_kwargs["trust_remote_code"] = True
     if use_quantization and quantization_config is not None:
@@ -187,6 +195,9 @@ def _load_model(model_key):
 
     if model is None:
         model = load_class.from_pretrained(spec["model_id"], **_build_model_kwargs(spec, use_quantization=False))
+
+    if spec["family"] == "llada8b" and device != "cpu":
+        model = model.to(device)
 
     model.eval()
 
