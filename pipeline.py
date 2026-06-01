@@ -250,8 +250,18 @@ def _build_prompt_text(tokenizer, spec, prompt):
             "<|im_start|>assistant\n"
         )
 
+    messages = _build_messages(spec, prompt)
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        **spec.get("chat_template_kwargs", {}),
+    )
+
+
+def _build_messages(spec, prompt):
     if spec["model_id"] == "deepseek-ai/deepseek-coder-6.7b-instruct":
-        messages = [
+        return [
             {
                 "role": "system",
                 "content": (
@@ -269,20 +279,8 @@ def _build_prompt_text(tokenizer, spec, prompt):
                 ),
             },
         ]
-        return tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            **spec.get("chat_template_kwargs", {}),
-        )
 
-    messages = [{"role": "user", "content": prompt}]
-    return tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        **spec.get("chat_template_kwargs", {}),
-    )
+    return [{"role": "user", "content": prompt}]
 
 
 def _encode_prompt(model_key, prompt, add_special_tokens=True):
@@ -293,13 +291,27 @@ def _encode_prompt(model_key, prompt, add_special_tokens=True):
 def _encode_prompts(model_key, prompts, add_special_tokens=True):
     model, tokenizer = _load_model(model_key)
     spec = MODEL_REGISTRY[model_key]
-    prompt_text = [_build_prompt_text(tokenizer, spec, prompt) for prompt in prompts]
-    encoded = tokenizer(
-        prompt_text,
-        return_tensors="pt",
-        padding=True,
-        add_special_tokens=add_special_tokens,
-    )
+
+    if spec["family"] == "llada8b":
+        conversations = [_build_messages(spec, prompt) for prompt in prompts]
+        encoded = tokenizer.apply_chat_template(
+            conversations,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True,
+            padding=True,
+            **spec.get("chat_template_kwargs", {}),
+        )
+    else:
+        prompt_text = [_build_prompt_text(tokenizer, spec, prompt) for prompt in prompts]
+        encoded = tokenizer(
+            prompt_text,
+            return_tensors="pt",
+            padding=True,
+            add_special_tokens=add_special_tokens,
+        )
+
     encoded = {name: tensor.to(device) for name, tensor in encoded.items()}
     return model, tokenizer, encoded
 
