@@ -74,7 +74,7 @@ MODEL_REGISTRY = {
         "model_id": "inclusionAI/LLaDA2.1-mini",
         "trust_remote_code": True,
         "quantized": True,
-        "batch_size": 4,
+        "batch_size": 2,
         "chat_template_kwargs": {},
     },
     "llada_8b_instruct": {
@@ -400,8 +400,18 @@ def _generate_llada21_batch(prompts, gen_length=MAX_GENERATION_TOKENS):
         cur_position_ids = position_ids[:, :current_window_end]
         block_start_pos = block_index * block_length
         post_steps = torch.zeros(batch_size, dtype=torch.int64, device=device)
+        refine_steps = 0
+        max_refine_steps = block_length + LLADA21_MAX_POST_STEPS + 4
 
         while True:
+            refine_steps += 1
+            if refine_steps > max_refine_steps:
+                print(
+                    f"[LLaDA2.1] Reached safety cap for block {block_index + 1}; "
+                    "moving on to avoid a stalled batch."
+                )
+                break
+
             cur_x = sample[:, :current_window_end]
             block_slice = cur_x[:, -block_length:]
             old_block_tokens = block_slice.clone()
@@ -425,7 +435,7 @@ def _generate_llada21_batch(prompts, gen_length=MAX_GENERATION_TOKENS):
                 cur_x,
                 attention_mask=cur_attn_mask,
                 position_ids=cur_position_ids,
-                output_attentions=True,
+                output_attentions=False,
             )
 
             logits = outputs.logits
@@ -506,14 +516,14 @@ def _generate_llada21_batch(prompts, gen_length=MAX_GENERATION_TOKENS):
     decoded = []
     for batch_index, prompt_length in enumerate(prompt_lengths_list):
         generated_answer = sample[batch_index, : prompt_length + gen_length]
-        mask_positions = (generated_answer[prompt_length:] == LLADA21_EOS_ID).nonzero(as_tuple=True)[0]
-        if len(mask_positions) > 0:
-            first_mask_position = int(mask_positions[0].item())
+        eos_positions = (generated_answer[prompt_length:] == LLADA21_EOS_ID).nonzero(as_tuple=True)[0]
+        if len(eos_positions) > 0:
+            first_eos_position = int(eos_positions[0].item())
         else:
-            first_mask_position = gen_length
+            first_eos_position = gen_length
 
         generated_tokens = generated_answer[
-            prompt_length: prompt_length + first_mask_position + 1
+            prompt_length: prompt_length + first_eos_position + 1
         ].tolist()
         decoded.append(tokenizer.decode(generated_tokens, skip_special_tokens=True).strip())
 
