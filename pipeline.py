@@ -10,11 +10,8 @@ from transformers.modeling_utils import PreTrainedModel
 
 
 MAX_GENERATION_TOKENS = 512
-LLADA21_THRESHOLD = 0.7
-LLADA21_EDITING_THRESHOLD = 0.5
-LLADA21_MAX_POST_STEPS = 16
-LLADA21_EOS_ID = 156892
-LLADA21_MASK_ID = 156895
+DREAMCODER_TEMPERATURE = 0.1
+DREAMCODER_TOP_P = 0.95
 LLADA8B_MASK_ID = 126336
 LLADA8B_BLOCK_LENGTH = 32
 DIFFUCODER_TEMPERATURE = 0.4
@@ -67,13 +64,13 @@ MODEL_REGISTRY = {
             "min_p": 0.0,
         },
     },
-    "llada21_mini": {
-        "label": "LLaDA2.1-mini",
+    "dreamcoder_v0_7b": {
+        "label": "Dream-Coder-v0-Instruct-7B",
         "group": "diffusion",
-        "family": "llada21",
-        "model_id": "inclusionAI/LLaDA2.1-mini",
+        "family": "dreamcoder",
+        "model_id": "Dream-org/Dream-Coder-v0-Instruct-7B",
         "trust_remote_code": True,
-        "quantized": True,
+        "quantized": False,
         "batch_size": 2,
         "chat_template_kwargs": {},
     },
@@ -101,7 +98,7 @@ MODEL_REGISTRY = {
 
 MODEL_GROUPS = {
     "ar": ["qwen25_coder", "deepseek_coder", "qwen3_8b"],
-    "diffusion": ["llada_8b_instruct", "diffucoder_7b", "llada21_mini"],
+    "diffusion": ["llada_8b_instruct", "diffucoder_7b", "dreamcoder_v0_7b"],
 }
 
 
@@ -154,7 +151,7 @@ _loaded_tokenizer = None
 
 
 def _model_load_class(spec):
-    if spec["family"] in {"llada8b", "diffucoder"}:
+    if spec["family"] in {"llada8b", "diffucoder", "dreamcoder"}:
         return AutoModel
     return AutoModelForCausalLM
 
@@ -164,7 +161,7 @@ def _build_model_kwargs(spec, use_quantization):
         "torch_dtype": _get_dense_dtype(),
     }
 
-    if spec["family"] not in {"llada8b", "diffucoder"}:
+    if spec["family"] not in {"llada8b", "diffucoder", "dreamcoder"}:
         model_kwargs["device_map"] = "auto"
 
     if spec["trust_remote_code"]:
@@ -209,7 +206,7 @@ def _load_model(model_key):
     if model is None:
         model = load_class.from_pretrained(spec["model_id"], **_build_model_kwargs(spec, use_quantization=False))
 
-    if spec["family"] in {"llada8b", "diffucoder"} and device != "cpu":
+    if spec["family"] in {"llada8b", "diffucoder", "dreamcoder"} and device != "cpu":
         model = model.to(device)
 
     model.eval()
@@ -347,187 +344,32 @@ def _generate_causal_lm_batch(model_key, prompts, max_new_tokens=MAX_GENERATION_
     return tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
 
 
-def _generate_llada21(prompt, gen_length=MAX_GENERATION_TOKENS):
-    return _generate_llada21_batch([prompt], gen_length=gen_length)[0]
+def _generate_dreamcoder(prompt, gen_length=MAX_GENERATION_TOKENS):
+    return _generate_dreamcoder_batch([prompt], gen_length=gen_length)[0]
 
 
-@torch.no_grad()
-def _generate_llada21_batch(prompts, gen_length=MAX_GENERATION_TOKENS):
-    model, tokenizer, encoded = _encode_prompts("llada21_mini", prompts)
+def _generate_dreamcoder_batch(prompts, gen_length=MAX_GENERATION_TOKENS):
+    model, tokenizer, encoded = _encode_prompts("dreamcoder_v0_7b", prompts)
     input_ids = encoded["input_ids"]
     attention_mask = encoded.get("attention_mask")
     if attention_mask is None:
         attention_mask = torch.ones_like(input_ids)
 
-    prompt_lengths = attention_mask.sum(dim=1).to(dtype=torch.long)
-    batch_size = input_ids.shape[0]
-    max_prompt_length = int(prompt_lengths.max().item())
-    block_length = 32
-    eos_early_stop = True
-
-    num_blocks = (max_prompt_length + gen_length + block_length - 1) // block_length
-    total_length = num_blocks * block_length
-
-    block_mask = torch.tril(torch.ones(num_blocks, num_blocks, device=device))
-    block_diffusion_attention_mask = (
-        block_mask.repeat_interleave(block_length, dim=0)
-        .repeat_interleave(block_length, dim=1)
-        .unsqueeze(0)
-        .unsqueeze(0)
-        .to(torch.bfloat16)
-        .repeat(batch_size, 1, 1, 1)
+    outputs = model.diffusion_generate(
+        input_ids,
+        attention_mask=attention_mask,
+        max_new_tokens=gen_length,
+        output_history=False,
+        return_dict_in_generate=True,
+        steps=gen_length,
+        temperature=DREAMCODER_TEMPERATURE,
+        top_p=DREAMCODER_TOP_P,
+        alg="entropy",
+        alg_temp=0.0,
     )
-
-    position_ids = torch.arange(total_length, device=device).unsqueeze(0).repeat(batch_size, 1)
-    sample = torch.full(
-        (batch_size, total_length),
-        LLADA21_MASK_ID,
-        dtype=torch.long,
-        device=device,
-    )
-
-    for batch_index in range(batch_size):
-        valid_tokens = input_ids[batch_index, attention_mask[batch_index].bool()]
-        sample[batch_index, :valid_tokens.shape[0]] = valid_tokens
-
-    start_block = int(prompt_lengths.min().item()) // block_length
-    prompt_lengths_list = [int(length.item()) for length in prompt_lengths]
-    finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
-
-    for block_index in range(start_block, num_blocks):
-        current_window_end = (block_index + 1) * block_length
-        cur_attn_mask = block_diffusion_attention_mask[:, :, :current_window_end, :current_window_end]
-        cur_position_ids = position_ids[:, :current_window_end]
-        block_start_pos = block_index * block_length
-        post_steps = torch.zeros(batch_size, dtype=torch.int64, device=device)
-        refine_steps = 0
-        max_refine_steps = block_length + LLADA21_MAX_POST_STEPS + 4
-
-        while True:
-            refine_steps += 1
-            if refine_steps > max_refine_steps:
-                print(
-                    f"[LLaDA2.1] Reached safety cap for block {block_index + 1}; "
-                    "moving on to avoid a stalled batch."
-                )
-                break
-
-            cur_x = sample[:, :current_window_end]
-            block_slice = cur_x[:, -block_length:]
-            old_block_tokens = block_slice.clone()
-            active_block_mask = block_slice == LLADA21_MASK_ID
-
-            no_active_mask = ~active_block_mask.any(dim=1)
-            post_steps[no_active_mask] += 1
-
-            if torch.all(no_active_mask & (post_steps > LLADA21_MAX_POST_STEPS)):
-                break
-
-            prompt_end_in_block = torch.clamp(
-                prompt_lengths - block_start_pos,
-                min=0,
-                max=block_length,
-            )
-            block_positions = torch.arange(block_length, device=device).unsqueeze(0)
-            prompt_mask_in_block = block_positions < prompt_end_in_block.unsqueeze(1)
-
-            outputs = model.forward(
-                cur_x,
-                attention_mask=cur_attn_mask,
-                position_ids=cur_position_ids,
-                output_attentions=False,
-            )
-
-            logits = outputs.logits
-            active_logits = logits[:, -block_length:, :]
-            x0, x0_p = model._sample_with_temperature_topk_topp(
-                active_logits,
-                temperature=0.0,
-                top_k=None,
-                top_p=None,
-            )
-
-            mask_transfer_index = torch.zeros_like(x0, dtype=torch.bool)
-            editing_transfer_index = torch.zeros_like(x0, dtype=torch.bool)
-
-            for batch_index in range(batch_size):
-                if finished[batch_index]:
-                    continue
-
-                row_active_mask = active_block_mask[batch_index]
-                row_prompt_mask = prompt_mask_in_block[batch_index]
-                row_x0 = x0[batch_index]
-                row_probs = x0_p[batch_index]
-                row_old_tokens = old_block_tokens[batch_index]
-
-                if row_active_mask.any():
-                    mask_confidence = torch.where(
-                        row_active_mask,
-                        row_probs,
-                        torch.full_like(row_probs, float("-inf")),
-                    )
-                    high_conf_mask = (mask_confidence > LLADA21_THRESHOLD) & row_active_mask
-                    num_high_confidence = int(high_conf_mask.sum().item())
-
-                    if num_high_confidence >= 1:
-                        mask_transfer_index[batch_index] = high_conf_mask
-                    else:
-                        num_available = int(row_active_mask.sum().item())
-                        if num_available > 0:
-                            _, idx = torch.topk(
-                                mask_confidence,
-                                k=min(1, num_available),
-                            )
-                            mask_transfer_index[batch_index, idx] = True
-
-                non_mask_positions = ~row_active_mask
-                non_prompt_positions = ~row_prompt_mask
-                editable_positions = non_mask_positions & non_prompt_positions
-                if editable_positions.any():
-                    editing_confidence = torch.where(
-                        editable_positions,
-                        row_probs,
-                        torch.full_like(row_probs, float("-inf")),
-                    )
-                    high_conf_editing = (editing_confidence > LLADA21_EDITING_THRESHOLD) & editable_positions
-                    token_changed = row_x0 != row_old_tokens
-                    editing_transfer_index[batch_index] = high_conf_editing & token_changed
-
-            final_transfer_index = mask_transfer_index | editing_transfer_index
-            if final_transfer_index.any():
-                block_slice[final_transfer_index] = x0[final_transfer_index]
-
-            if eos_early_stop:
-                for batch_index, prompt_length in enumerate(prompt_lengths_list):
-                    if finished[batch_index] or prompt_length >= current_window_end:
-                        continue
-
-                    generated_part = sample[batch_index, prompt_length:current_window_end]
-                    if (generated_part == LLADA21_MASK_ID).sum() == 0:
-                        eos_positions = (generated_part == LLADA21_EOS_ID).nonzero(as_tuple=True)[0]
-                        if len(eos_positions) > 0:
-                            finished[batch_index] = True
-
-            sample[:, :current_window_end] = cur_x
-
-            if torch.all(no_active_mask & (post_steps > LLADA21_MAX_POST_STEPS)):
-                break
-
-    decoded = []
-    for batch_index, prompt_length in enumerate(prompt_lengths_list):
-        generated_answer = sample[batch_index, : prompt_length + gen_length]
-        eos_positions = (generated_answer[prompt_length:] == LLADA21_EOS_ID).nonzero(as_tuple=True)[0]
-        if len(eos_positions) > 0:
-            first_eos_position = int(eos_positions[0].item())
-        else:
-            first_eos_position = gen_length
-
-        generated_tokens = generated_answer[
-            prompt_length: prompt_length + first_eos_position + 1
-        ].tolist()
-        decoded.append(tokenizer.decode(generated_tokens, skip_special_tokens=True).strip())
-
-    return decoded
+    generated_tokens = outputs.sequences[:, input_ids.shape[1]:]
+    decoded = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+    return [text.strip() for text in decoded]
 
 
 def _llada8b_add_gumbel_noise(logits, temperature):
@@ -668,8 +510,8 @@ def generate_batch_with_model(model_key, prompts, max_new_tokens=MAX_GENERATION_
 
     if family == "chat_causal_lm":
         return _generate_causal_lm_batch(model_key, prompts, max_new_tokens=max_new_tokens)
-    if family == "llada21":
-        return _generate_llada21_batch(prompts, gen_length=max_new_tokens)
+    if family == "dreamcoder":
+        return _generate_dreamcoder_batch(prompts, gen_length=max_new_tokens)
     if family == "llada8b":
         return _generate_llada8b_batch(prompts, gen_length=max_new_tokens)
     if family == "diffucoder":
