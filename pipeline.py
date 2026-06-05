@@ -6,12 +6,12 @@ import torch
 import torch.nn.functional as F
 import transformers
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers.modeling_utils import PreTrainedModel
 
 
 MAX_GENERATION_TOKENS = 512
-LLADA21_THRESHOLD = 0.7
-LLADA21_EDITING_THRESHOLD = 0.5
-LLADA21_MAX_POST_STEPS = 16
+DREAMCODER_TEMPERATURE = 0.1
+DREAMCODER_TOP_P = 0.95
 LLADA8B_MASK_ID = 126336
 LLADA8B_BLOCK_LENGTH = 32
 DIFFUCODER_TEMPERATURE = 0.4
@@ -26,6 +26,7 @@ MODEL_REGISTRY = {
         "model_id": "Qwen/Qwen2.5-Coder-7B-Instruct",
         "trust_remote_code": False,
         "quantized": True,
+        "batch_size": 8,
         "chat_template_kwargs": {},
         "generation_kwargs": {
             "do_sample": False,
@@ -38,6 +39,7 @@ MODEL_REGISTRY = {
         "model_id": "deepseek-ai/deepseek-coder-6.7b-instruct",
         "trust_remote_code": True,
         "quantized": True,
+        "batch_size": 8,
         "chat_template_kwargs": {},
         "generation_kwargs": {
             "do_sample": False,
@@ -50,6 +52,7 @@ MODEL_REGISTRY = {
         "model_id": "Qwen/Qwen3-8B",
         "trust_remote_code": False,
         "quantized": True,
+        "batch_size": 8,
         "chat_template_kwargs": {
             "enable_thinking": False,
         },
@@ -61,13 +64,14 @@ MODEL_REGISTRY = {
             "min_p": 0.0,
         },
     },
-    "llada21_mini": {
-        "label": "LLaDA2.1-mini",
+    "dreamcoder_v0_7b": {
+        "label": "Dream-Coder-v0-Instruct-7B",
         "group": "diffusion",
-        "family": "llada21",
-        "model_id": "inclusionAI/LLaDA2.1-mini",
+        "family": "dreamcoder",
+        "model_id": "Dream-org/Dream-Coder-v0-Instruct-7B",
         "trust_remote_code": True,
-        "quantized": True,
+        "quantized": False,
+        "batch_size": 2,
         "chat_template_kwargs": {},
     },
     "llada_8b_instruct": {
@@ -76,7 +80,8 @@ MODEL_REGISTRY = {
         "family": "llada8b",
         "model_id": "GSAI-ML/LLaDA-8B-Instruct",
         "trust_remote_code": True,
-        "quantized": True,
+        "quantized": False,
+        "batch_size": 1,
         "chat_template_kwargs": {},
     },
     "diffucoder_7b": {
@@ -85,14 +90,15 @@ MODEL_REGISTRY = {
         "family": "diffucoder",
         "model_id": "apple/DiffuCoder-7B-cpGRPO",
         "trust_remote_code": True,
-        "quantized": True,
+        "quantized": False,
+        "batch_size": 1,
         "chat_template_kwargs": {},
     },
 }
 
 MODEL_GROUPS = {
     "ar": ["qwen25_coder", "deepseek_coder", "qwen3_8b"],
-    "diffusion": ["llada_8b_instruct", "diffucoder_7b", "llada21_mini"],
+    "diffusion": ["llada_8b_instruct", "diffucoder_7b", "dreamcoder_v0_7b"],
 }
 
 
@@ -115,6 +121,10 @@ print("[Shim] Injected create_bidirectional_mask shim into transformers.masking_
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
+
+
+if not hasattr(PreTrainedModel, "all_tied_weights_keys"):
+    PreTrainedModel.all_tied_weights_keys = []
 
 
 def _get_dense_dtype():
@@ -141,16 +151,19 @@ _loaded_tokenizer = None
 
 
 def _model_load_class(spec):
-    if spec["family"] in {"llada8b", "diffucoder"}:
+    if spec["family"] in {"llada8b", "diffucoder", "dreamcoder"}:
         return AutoModel
     return AutoModelForCausalLM
 
 
 def _build_model_kwargs(spec, use_quantization):
     model_kwargs = {
-        "device_map": "auto",
         "torch_dtype": _get_dense_dtype(),
     }
+
+    if spec["family"] not in {"llada8b", "diffucoder", "dreamcoder"}:
+        model_kwargs["device_map"] = "auto"
+
     if spec["trust_remote_code"]:
         model_kwargs["trust_remote_code"] = True
     if use_quantization and quantization_config is not None:
@@ -175,6 +188,11 @@ def _load_model(model_key):
         tokenizer_kwargs["trust_remote_code"] = True
     tokenizer = AutoTokenizer.from_pretrained(spec["model_id"], **tokenizer_kwargs)
 
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.padding_side != "left":
+        tokenizer.padding_side = "left"
+
     model = None
     wants_quantization = spec["quantized"] and quantization_config is not None
     if wants_quantization:
@@ -188,10 +206,15 @@ def _load_model(model_key):
     if model is None:
         model = load_class.from_pretrained(spec["model_id"], **_build_model_kwargs(spec, use_quantization=False))
 
+    if spec["family"] in {"llada8b", "diffucoder", "dreamcoder"} and device != "cpu":
+        model = model.to(device)
+
     model.eval()
 
     if model_key == "llada_8b_instruct" and tokenizer.padding_side != "left":
         tokenizer.padding_side = "left"
+    if model_key == "llada_8b_instruct" and tokenizer.pad_token_id == LLADA8B_MASK_ID:
+        raise ValueError("LLaDA-8B pad_token_id matches the mask token id; upstream generation code requires a different pad token.")
 
     _loaded_model_key = model_key
     _loaded_model = model
@@ -218,7 +241,17 @@ def unload_all_models():
 
 
 def _build_prompt_text(tokenizer, spec, prompt):
-    messages = [{"role": "user", "content": prompt}]
+    if spec["family"] == "diffucoder":
+        return (
+            "<|im_start|>system\n"
+            "You are a software engineer. Keep the solutions concise and focused.<|im_end|>\n"
+            "<|im_start|>user\n"
+            f"{prompt.strip()}\n"
+            "<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+
+    messages = _build_messages(spec, prompt)
     return tokenizer.apply_chat_template(
         messages,
         tokenize=False,
@@ -227,21 +260,75 @@ def _build_prompt_text(tokenizer, spec, prompt):
     )
 
 
+def _build_messages(spec, prompt):
+    if spec["model_id"] == "deepseek-ai/deepseek-coder-6.7b-instruct":
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "Return only the full edited Python program. "
+                    "Do not include markdown fences, explanations, notebook tags, or any text before or after the code. "
+                    "Start directly with Python code and output the final program only."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"{prompt.strip()}\n\n"
+                    "Respond with Python code only. "
+                    "No markdown fences. No explanation. No surrounding prose."
+                ),
+            },
+        ]
+
+    return [{"role": "user", "content": prompt}]
+
+
 def _encode_prompt(model_key, prompt, add_special_tokens=True):
+    model, tokenizer, encoded = _encode_prompts(model_key, [prompt], add_special_tokens=add_special_tokens)
+    return model, tokenizer, {name: tensor[:1] for name, tensor in encoded.items()}
+
+
+def _encode_prompts(model_key, prompts, add_special_tokens=True):
     model, tokenizer = _load_model(model_key)
     spec = MODEL_REGISTRY[model_key]
-    prompt_text = _build_prompt_text(tokenizer, spec, prompt)
-    encoded = tokenizer(
-        prompt_text,
-        return_tensors="pt",
-        add_special_tokens=add_special_tokens,
-    )
+
+    if spec["family"] == "llada8b":
+        messages = [{"role": "user", "content": prompt} for prompt in prompts]
+        prompt_text = [
+            tokenizer.apply_chat_template(
+                [message],
+                tokenize=False,
+                add_generation_prompt=True,
+                **spec.get("chat_template_kwargs", {}),
+            )
+            for message in messages
+        ]
+        encoded = tokenizer(
+            prompt_text,
+            return_tensors="pt",
+            padding=True,
+            add_special_tokens=False,
+        )
+    else:
+        prompt_text = [_build_prompt_text(tokenizer, spec, prompt) for prompt in prompts]
+        encoded = tokenizer(
+            prompt_text,
+            return_tensors="pt",
+            padding=True,
+            add_special_tokens=add_special_tokens,
+        )
+
     encoded = {name: tensor.to(device) for name, tensor in encoded.items()}
     return model, tokenizer, encoded
 
 
 def _generate_causal_lm(model_key, prompt, max_new_tokens=MAX_GENERATION_TOKENS):
-    model, tokenizer, encoded = _encode_prompt(model_key, prompt)
+    return _generate_causal_lm_batch(model_key, [prompt], max_new_tokens=max_new_tokens)[0]
+
+
+def _generate_causal_lm_batch(model_key, prompts, max_new_tokens=MAX_GENERATION_TOKENS):
+    model, tokenizer, encoded = _encode_prompts(model_key, prompts)
     input_length = encoded["input_ids"].shape[1]
     generation_kwargs = dict(MODEL_REGISTRY[model_key].get("generation_kwargs", {}))
     generation_kwargs.update({
@@ -253,25 +340,36 @@ def _generate_causal_lm(model_key, prompt, max_new_tokens=MAX_GENERATION_TOKENS)
         generation_kwargs["eos_token_id"] = tokenizer.eos_token_id
 
     outputs = model.generate(**encoded, **generation_kwargs)
-    generated_tokens = outputs[0][input_length:]
-    return tokenizer.decode(generated_tokens, skip_special_tokens=True)
+    generated_tokens = outputs[:, input_length:]
+    return tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
 
 
-def _generate_llada21(prompt, gen_length=MAX_GENERATION_TOKENS):
-    model, tokenizer, encoded = _encode_prompt("llada21_mini", prompt)
-    outputs = model.generate(
-        inputs=encoded["input_ids"],
-        gen_length=gen_length,
-        block_length=32,
-        threshold=LLADA21_THRESHOLD,
-        editing_threshold=LLADA21_EDITING_THRESHOLD,
-        max_post_steps=LLADA21_MAX_POST_STEPS,
-        eos_early_stop=True,
-        temperature=0.0,
-        top_p=None,
-        top_k=None,
+def _generate_dreamcoder(prompt, gen_length=MAX_GENERATION_TOKENS):
+    return _generate_dreamcoder_batch([prompt], gen_length=gen_length)[0]
+
+
+def _generate_dreamcoder_batch(prompts, gen_length=MAX_GENERATION_TOKENS):
+    model, tokenizer, encoded = _encode_prompts("dreamcoder_v0_7b", prompts)
+    input_ids = encoded["input_ids"]
+    attention_mask = encoded.get("attention_mask")
+    if attention_mask is None:
+        attention_mask = torch.ones_like(input_ids)
+
+    outputs = model.diffusion_generate(
+        input_ids,
+        attention_mask=attention_mask,
+        max_new_tokens=gen_length,
+        output_history=False,
+        return_dict_in_generate=True,
+        steps=gen_length,
+        temperature=DREAMCODER_TEMPERATURE,
+        top_p=DREAMCODER_TOP_P,
+        alg="entropy",
+        alg_temp=0.0,
     )
-    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+    generated_tokens = outputs.sequences[:, input_ids.shape[1]:]
+    decoded = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+    return [text.strip() for text in decoded]
 
 
 def _llada8b_add_gumbel_noise(logits, temperature):
@@ -360,7 +458,11 @@ def _llada8b_generate(model, prompt_ids, attention_mask=None, steps=MAX_GENERATI
 
 
 def _generate_llada8b(prompt, gen_length=MAX_GENERATION_TOKENS):
-    model, tokenizer, encoded = _encode_prompt("llada_8b_instruct", prompt, add_special_tokens=False)
+    return _generate_llada8b_batch([prompt], gen_length=gen_length)[0]
+
+
+def _generate_llada8b_batch(prompts, gen_length=MAX_GENERATION_TOKENS):
+    model, tokenizer, encoded = _encode_prompts("llada_8b_instruct", prompts, add_special_tokens=False)
     outputs = _llada8b_generate(
         model,
         encoded["input_ids"],
@@ -372,11 +474,15 @@ def _generate_llada8b(prompt, gen_length=MAX_GENERATION_TOKENS):
     )
     generated_tokens = outputs[:, encoded["input_ids"].shape[1]:]
     decoded = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
-    return decoded[0].strip()
+    return [text.strip() for text in decoded]
 
 
 def _generate_diffucoder(prompt, gen_length=MAX_GENERATION_TOKENS):
-    model, tokenizer, encoded = _encode_prompt("diffucoder_7b", prompt)
+    return _generate_diffucoder_batch([prompt], gen_length=gen_length)[0]
+
+
+def _generate_diffucoder_batch(prompts, gen_length=MAX_GENERATION_TOKENS):
+    model, tokenizer, encoded = _encode_prompts("diffucoder_7b", prompts)
     input_length = encoded["input_ids"].shape[1]
     outputs = model.diffusion_generate(
         encoded["input_ids"],
@@ -390,21 +496,29 @@ def _generate_diffucoder(prompt, gen_length=MAX_GENERATION_TOKENS):
         alg="entropy",
         alg_temp=0.0,
     )
-    generated_tokens = outputs.sequences[0][input_length:]
-    decoded = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-    return decoded.split("<|dlm_pad|>")[0].strip()
+    generated_tokens = outputs.sequences[:, input_length:]
+    decoded = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+    return [text.split("<|dlm_pad|>")[0].strip() for text in decoded]
 
 
-def generate_with_model(model_key, prompt, max_new_tokens=MAX_GENERATION_TOKENS):
+def get_model_batch_size(model_key):
+    return MODEL_REGISTRY[model_key].get("batch_size", 1)
+
+
+def generate_batch_with_model(model_key, prompts, max_new_tokens=MAX_GENERATION_TOKENS):
     family = MODEL_REGISTRY[model_key]["family"]
 
     if family == "chat_causal_lm":
-        return _generate_causal_lm(model_key, prompt, max_new_tokens=max_new_tokens)
-    if family == "llada21":
-        return _generate_llada21(prompt, gen_length=max_new_tokens)
+        return _generate_causal_lm_batch(model_key, prompts, max_new_tokens=max_new_tokens)
+    if family == "dreamcoder":
+        return _generate_dreamcoder_batch(prompts, gen_length=max_new_tokens)
     if family == "llada8b":
-        return _generate_llada8b(prompt, gen_length=max_new_tokens)
+        return _generate_llada8b_batch(prompts, gen_length=max_new_tokens)
     if family == "diffucoder":
-        return _generate_diffucoder(prompt, gen_length=max_new_tokens)
+        return _generate_diffucoder_batch(prompts, gen_length=max_new_tokens)
 
     raise ValueError(f"Unsupported model family: {family}")
+
+
+def generate_with_model(model_key, prompt, max_new_tokens=MAX_GENERATION_TOKENS):
+    return generate_batch_with_model(model_key, [prompt], max_new_tokens=max_new_tokens)[0]
