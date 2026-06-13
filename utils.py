@@ -4,13 +4,24 @@ import re
 TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 FENCED_CODE_PATTERN = re.compile(r"```(?:python)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
 JUPYTER_CODE_PATTERN = re.compile(r"<jupyter_code>\s*(.*?)(?=<jupyter_output>|<jupyter_text>|<jupyter_code>|$)", re.DOTALL | re.IGNORECASE)
-NOTEBOOK_TAG_PATTERN = re.compile(r"</?jupyter_(?:code|output|text)>|<empty_output>", re.IGNORECASE)
+FENCE_TOKEN_PATTERN = re.compile(r"```(?:python)?", re.IGNORECASE)
+NOTEBOOK_TAG_PATTERN = re.compile(
+    r"</?(?:jupyter_(?:code|output|text)|j(?:up(?:yter)?|yupyter|upupyter)[_\\/\-]?(?:code|output|text|p)?|s(?:[_\\/\-][^>\n]+)?|up)>|<empty_output>|</>",
+    re.IGNORECASE,
+)
+STRUCTURED_LINE_PATTERN = re.compile(r"^\s*(?:from |import |class |def |async def |@)")
+
+
+def _decode_generated_text(text):
+    normalized = text.replace("\u0120", " ").replace("\u010a", "\n")
+    normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
+    return normalized.strip()
 
 
 def _normalize_generated_text(text):
-    normalized = text.replace("\u0120", " ").replace("\u010a", "\n")
+    normalized = _decode_generated_text(text)
+    normalized = FENCE_TOKEN_PATTERN.sub("\n", normalized)
     normalized = NOTEBOOK_TAG_PATTERN.sub("\n", normalized)
-    normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
     return normalized.strip()
 
 
@@ -18,6 +29,14 @@ def _clean_code_candidate(candidate):
     cleaned = _normalize_generated_text(candidate)
     cleaned_lines = [line.rstrip() for line in cleaned.splitlines()]
     return "\n".join(cleaned_lines).strip()
+
+
+def _expand_compact_python(candidate):
+    if "\n" in candidate or "    " not in candidate:
+        return candidate
+
+    expanded = re.sub(r"(?<=\S)( {4,})(?=\S)", lambda match: "\n" + match.group(1), candidate)
+    return expanded.strip()
 
 
 def _looks_like_python(candidate):
@@ -45,7 +64,8 @@ def _python_candidate_score(candidate):
             continue
         code_like_lines += 1
 
-    return (code_like_lines - prose_like_lines, code_like_lines, -prose_like_lines, len(candidate))
+    markup_penalty = candidate.count("```") + len(NOTEBOOK_TAG_PATTERN.findall(candidate))
+    return (code_like_lines - prose_like_lines, -markup_penalty, code_like_lines, -prose_like_lines, -len(candidate))
 
 
 def _is_parseable_python(candidate):
@@ -60,7 +80,7 @@ def _is_parseable_python(candidate):
 
 
 def _collect_code_candidates(text):
-    token_normalized = text.replace("\u0120", " ").replace("\u010a", "\n")
+    token_normalized = _decode_generated_text(text)
     token_normalized = token_normalized.replace("\r\n", "\n").replace("\r", "\n")
     normalized = _normalize_generated_text(text)
     candidates = []
@@ -70,12 +90,37 @@ def _collect_code_candidates(text):
             cleaned = _clean_code_candidate(match)
             if cleaned:
                 candidates.append(cleaned)
+                expanded = _expand_compact_python(cleaned)
+                if expanded != cleaned:
+                    candidates.append(expanded)
 
     cleaned_full_text = _clean_code_candidate(normalized)
     if cleaned_full_text:
         candidates.append(cleaned_full_text)
+        expanded_full_text = _expand_compact_python(cleaned_full_text)
+        if expanded_full_text != cleaned_full_text:
+            candidates.append(expanded_full_text)
 
-    return candidates
+        blocks = [block.strip() for block in re.split(r"\n\s*\n+", cleaned_full_text) if block.strip()]
+        for block in blocks:
+            if STRUCTURED_LINE_PATTERN.match(block) or _is_parseable_python(block):
+                candidates.append(block)
+
+        cleaned_lines = cleaned_full_text.splitlines()
+        for index, line in enumerate(cleaned_lines):
+            if STRUCTURED_LINE_PATTERN.match(line):
+                candidate = "\n".join(cleaned_lines[index:]).strip()
+                if candidate:
+                    candidates.append(candidate)
+
+    deduped_candidates = []
+    seen = set()
+    for candidate in candidates:
+        if candidate not in seen:
+            seen.add(candidate)
+            deduped_candidates.append(candidate)
+
+    return deduped_candidates
 
 
 def _select_best_candidate(candidates):
@@ -106,7 +151,7 @@ def extract_python_code(text):
 
 
 def is_degenerate_output(text, repeated_line_threshold=4, ngram_size=8, repeated_ngram_threshold=3):
-    normalized_text = text.strip()
+    normalized_text = _decode_generated_text(text)
     if not normalized_text:
         return False
 
