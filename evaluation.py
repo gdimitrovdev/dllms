@@ -65,4 +65,4 @@ def calculate_ast_deviation(code_prefix, code_suffix):
     max_nodes = max(nodes_p, nodes_s)
     normalized_diff = edit_distance / max_nodes if max_nodes > 0 else 0
     
-    return 1 - normalized_diff
+    return max(0.0, 1 - normalized_diff)
