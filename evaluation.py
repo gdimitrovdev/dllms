@@ -1,3 +1,6 @@
+import ast
+import multiprocessing
+
 from tree_sitter import Language, Parser
 import tree_sitter_python as tspython
 from zss import distance
@@ -66,3 +69,127 @@ def calculate_ast_deviation(code_prefix, code_suffix):
     normalized_diff = edit_distance / max_nodes if max_nodes > 0 else 0
     
     return max(0.0, 1 - normalized_diff)
+
+
+def _normalize_test_body(tests):
+    if not tests or not tests.strip():
+        return []
+
+    module = ast.parse(tests)
+    body = module.body
+    if len(body) == 1 and isinstance(body[0], ast.If):
+        test = body[0].test
+        if isinstance(test, ast.Constant) and test.value is True:
+            body = body[0].body
+    return body
+
+
+def _statement_contains_assert(statement):
+    return any(isinstance(node, ast.Assert) for node in ast.walk(statement))
+
+
+def count_canitedit_test_cases(tests):
+    try:
+        body = _normalize_test_body(tests)
+    except SyntaxError:
+        return 0
+    return sum(1 for statement in body if _statement_contains_assert(statement))
+
+
+def _execute_statement(statement, namespace):
+    module = ast.Module(body=[statement], type_ignores=[])
+    ast.fix_missing_locations(module)
+    exec(compile(module, "<canitedit-tests>", "exec"), namespace)
+
+
+def _run_canitedit_tests_worker(code, tests, queue):
+    total = count_canitedit_test_cases(tests)
+
+    try:
+        body = _normalize_test_body(tests)
+        namespace = {}
+        exec(compile(code, "<candidate>", "exec"), namespace)
+
+        passed = 0
+        aborted = False
+        for statement in body:
+            is_test_case = _statement_contains_assert(statement)
+            if aborted:
+                continue
+
+            try:
+                _execute_statement(statement, namespace)
+                if is_test_case:
+                    passed += 1
+            except Exception:
+                if not is_test_case:
+                    aborted = True
+
+        queue.put({
+            "passed": passed,
+            "total": total,
+            "suite_passed": total > 0 and passed == total and not aborted,
+            "timed_out": False,
+            "errored": False,
+        })
+    except Exception:
+        queue.put({
+            "passed": 0,
+            "total": total,
+            "suite_passed": False,
+            "timed_out": False,
+            "errored": True,
+        })
+
+
+def run_canitedit_tests(code, tests, timeout_seconds=5):
+    total = count_canitedit_test_cases(tests)
+    if total == 0:
+        return {
+            "passed": 0,
+            "total": 0,
+            "pass_rate": None,
+            "suite_passed": False,
+            "timed_out": False,
+            "errored": False,
+        }
+
+    if not code or not code.strip() or not is_valid_python(code):
+        return {
+            "passed": 0,
+            "total": total,
+            "pass_rate": 0.0,
+            "suite_passed": False,
+            "timed_out": False,
+            "errored": False,
+        }
+
+    queue = multiprocessing.Queue()
+    process = multiprocessing.Process(target=_run_canitedit_tests_worker, args=(code, tests, queue))
+    process.start()
+    process.join(timeout_seconds)
+
+    if process.is_alive():
+        process.terminate()
+        process.join()
+        return {
+            "passed": 0,
+            "total": total,
+            "pass_rate": 0.0,
+            "suite_passed": False,
+            "timed_out": True,
+            "errored": False,
+        }
+
+    result = {
+        "passed": 0,
+        "total": total,
+        "suite_passed": False,
+        "timed_out": False,
+        "errored": process.exitcode not in (0, None),
+    }
+    if not queue.empty():
+        result.update(queue.get())
+
+    result["pass_rate"] = result["passed"] / total if total > 0 else None
+    return result

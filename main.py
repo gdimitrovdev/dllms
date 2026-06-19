@@ -5,7 +5,7 @@ import time
 import torch
 
 from data import load_all_canitedit_samples
-from evaluation import calculate_ast_deviation, is_valid_python
+from evaluation import calculate_ast_deviation, is_valid_python, run_canitedit_tests
 from permutations import generate_positional_prompts
 from pipeline import MODEL_GROUPS, MODEL_REGISTRY, generate_batch_with_model, generate_with_model, get_model_batch_size, unload_all_models
 from utils import extract_python_code, is_degenerate_output
@@ -14,6 +14,35 @@ from utils import extract_python_code, is_degenerate_output
 CACHE_VERSION = "v3_multi_model"
 GOLD_CORRECTNESS_THRESHOLD = 0.95
 CACHE_DIR = "cache_artifacts"
+TEST_TIMEOUT_SECONDS = 5
+
+
+AST_METRIC_KEYS = {
+    "generation_count",
+    "valid_count",
+    "degenerate_count",
+    "gold_scores",
+    "correct_count",
+    "raw_invariance_scores",
+    "filtered_invariance_scores",
+    "correct_filtered_invariance_scores",
+    "pair_count",
+    "filtered_pair_count",
+    "correct_pair_count",
+}
+
+
+TEST_METRIC_KEYS = {
+    "test_passed_count",
+    "test_total_count",
+    "test_suite_pass_count",
+    "test_timeout_count",
+    "test_error_count",
+    "test_pass_rates",
+    "test_invariance_scores",
+    "test_pair_count",
+    "test_suite_agreement_count",
+}
 
 
 def initialize_metrics():
@@ -29,10 +58,19 @@ def initialize_metrics():
         "pair_count": 0,
         "filtered_pair_count": 0,
         "correct_pair_count": 0,
+        "test_passed_count": 0,
+        "test_total_count": 0,
+        "test_suite_pass_count": 0,
+        "test_timeout_count": 0,
+        "test_error_count": 0,
+        "test_pass_rates": [],
+        "test_invariance_scores": [],
+        "test_pair_count": 0,
+        "test_suite_agreement_count": 0,
     }
 
 
-def evaluate_generation(raw_text, gold_code):
+def evaluate_generation(raw_text, gold_code, tests):
     code = extract_python_code(raw_text)
     degenerate = is_degenerate_output(raw_text)
     valid = bool(code) and is_valid_python(code)
@@ -43,12 +81,15 @@ def evaluate_generation(raw_text, gold_code):
         gold_score = calculate_ast_deviation(code, gold_code)
         correct = gold_score >= GOLD_CORRECTNESS_THRESHOLD
 
+    test_result = run_canitedit_tests(code, tests, timeout_seconds=TEST_TIMEOUT_SECONDS)
+
     return {
         "code": code,
         "valid": valid,
         "degenerate": degenerate,
         "gold_score": gold_score,
         "correct": correct,
+        "test_result": test_result,
     }
 
 
@@ -62,6 +103,18 @@ def record_generation(metrics, generation):
         metrics["gold_scores"].append(generation["gold_score"])
     if generation["correct"]:
         metrics["correct_count"] += 1
+
+    test_result = generation["test_result"]
+    metrics["test_passed_count"] += test_result["passed"]
+    metrics["test_total_count"] += test_result["total"]
+    if test_result["suite_passed"]:
+        metrics["test_suite_pass_count"] += 1
+    if test_result["timed_out"]:
+        metrics["test_timeout_count"] += 1
+    if test_result["errored"]:
+        metrics["test_error_count"] += 1
+    if test_result["pass_rate"] is not None:
+        metrics["test_pass_rates"].append(test_result["pass_rate"])
 
 
 def format_score(score):
@@ -88,12 +141,21 @@ def summarize_model(name, metrics, total_samples):
     raw_avg = sum(metrics["raw_invariance_scores"]) / len(metrics["raw_invariance_scores"]) if metrics["raw_invariance_scores"] else None
     filtered_avg = sum(metrics["filtered_invariance_scores"]) / len(metrics["filtered_invariance_scores"]) if metrics["filtered_invariance_scores"] else None
     correct_filtered_avg = sum(metrics["correct_filtered_invariance_scores"]) / len(metrics["correct_filtered_invariance_scores"]) if metrics["correct_filtered_invariance_scores"] else None
+    avg_test_pass_rate = metrics["test_passed_count"] / metrics["test_total_count"] if metrics["test_total_count"] else None
+    avg_test_invariance = sum(metrics["test_invariance_scores"]) / len(metrics["test_invariance_scores"]) if metrics["test_invariance_scores"] else None
+    suite_pass_rate = metrics["test_suite_pass_count"] / generation_count
+    suite_agreement_rate = metrics["test_suite_agreement_count"] / metrics["test_pair_count"] if metrics["test_pair_count"] else None
 
     print(f"\n{name} summary:")
     print(f"  Syntax-valid generation rate:              {valid_rate:.4f} ({metrics['valid_count']}/{generation_count})")
     print(f"  Degeneration rate:                         {degeneration_rate:.4f} ({metrics['degenerate_count']}/{generation_count})")
     print(f"  Average gold AST similarity:               {format_score(avg_gold_score)}")
     print(f"  Gold-correct generation rate (>= {GOLD_CORRECTNESS_THRESHOLD:.2f}): {correct_rate:.4f} ({metrics['correct_count']}/{generation_count})")
+    print(f"  Test assertion pass rate:                  {format_score(avg_test_pass_rate)} ({metrics['test_passed_count']}/{metrics['test_total_count']})")
+    print(f"  Full test-suite pass rate:                 {suite_pass_rate:.4f} ({metrics['test_suite_pass_count']}/{generation_count})")
+    print(f"  Test-suite invariance score:               {format_score(avg_test_invariance)} ({metrics['test_pair_count']}/{total_samples} pairs)")
+    print(f"  Test-suite agreement rate:                 {format_score(suite_agreement_rate)} ({metrics['test_suite_agreement_count']}/{metrics['test_pair_count'] if metrics['test_pair_count'] else 0} pairs)")
+    print(f"  Test timeouts/errors:                      {metrics['test_timeout_count']}/{metrics['test_error_count']}")
     print(f"  Raw order-invariance score:                {format_score(raw_avg)} ({len(metrics['raw_invariance_scores'])}/{total_samples} pairs)")
     print(f"  Filtered order-invariance score:           {format_score(filtered_avg)} ({metrics['filtered_pair_count']}/{total_samples} valid/non-degenerate pairs)")
     print(f"  Gold-conditioned order-invariance score:   {format_score(correct_filtered_avg)} ({metrics['correct_pair_count']}/{total_samples} valid/correct pairs)")
@@ -114,6 +176,15 @@ def merge_metrics(metrics_list):
         merged["raw_invariance_scores"].extend(metrics["raw_invariance_scores"])
         merged["filtered_invariance_scores"].extend(metrics["filtered_invariance_scores"])
         merged["correct_filtered_invariance_scores"].extend(metrics["correct_filtered_invariance_scores"])
+        merged["test_passed_count"] += metrics["test_passed_count"]
+        merged["test_total_count"] += metrics["test_total_count"]
+        merged["test_suite_pass_count"] += metrics["test_suite_pass_count"]
+        merged["test_timeout_count"] += metrics["test_timeout_count"]
+        merged["test_error_count"] += metrics["test_error_count"]
+        merged["test_pair_count"] += metrics["test_pair_count"]
+        merged["test_suite_agreement_count"] += metrics["test_suite_agreement_count"]
+        merged["test_pass_rates"].extend(metrics["test_pass_rates"])
+        merged["test_invariance_scores"].extend(metrics["test_invariance_scores"])
 
     return merged
 
@@ -169,8 +240,30 @@ def cache_entry_complete(entry):
 
 
 def metrics_cache_complete(cache, total_samples):
-    required_keys = set(initialize_metrics().keys())
-    return bool(cache) and required_keys.issubset(cache.keys()) and cache.get("pair_count") == total_samples
+    return metrics_cache_has_ast(cache, total_samples) and metrics_cache_has_test(cache, total_samples)
+
+
+def metrics_cache_has_ast(cache, total_samples):
+    return bool(cache) and AST_METRIC_KEYS.issubset(cache.keys()) and cache.get("pair_count") == total_samples
+
+
+def metrics_cache_has_test(cache, total_samples):
+    expected_generation_count = total_samples * 2
+    return (
+        bool(cache)
+        and TEST_METRIC_KEYS.issubset(cache.keys())
+        and cache.get("test_pair_count") == total_samples
+        and len(cache.get("test_pass_rates", [])) == expected_generation_count
+    )
+
+
+def merge_cached_metrics(ast_metrics, test_metrics):
+    merged = initialize_metrics()
+    for key, value in ast_metrics.items():
+        merged[key] = value
+    for key, value in test_metrics.items():
+        merged[key] = value
+    return merged
 
 
 def save_evaluation_cache(model_key, metrics):
@@ -262,8 +355,8 @@ def evaluate_model_results(model_key, samples, model_results):
     for index, sample in enumerate(samples):
         result = model_results[index]
 
-        prefix_eval = evaluate_generation(result["prefix_output"], sample.get("after", ""))
-        suffix_eval = evaluate_generation(result["suffix_output"], sample.get("after", ""))
+        prefix_eval = evaluate_generation(result["prefix_output"], sample.get("after", ""), sample.get("tests", ""))
+        suffix_eval = evaluate_generation(result["suffix_output"], sample.get("after", ""), sample.get("tests", ""))
 
         for generation in (prefix_eval, suffix_eval):
             record_generation(metrics, generation)
@@ -284,9 +377,51 @@ def evaluate_model_results(model_key, samples, model_results):
                 metrics["correct_filtered_invariance_scores"].append(filtered_score)
                 metrics["correct_pair_count"] += 1
 
+        prefix_test_rate = prefix_eval["test_result"]["pass_rate"]
+        suffix_test_rate = suffix_eval["test_result"]["pass_rate"]
+        if prefix_test_rate is not None and suffix_test_rate is not None:
+            metrics["test_pair_count"] += 1
+            metrics["test_invariance_scores"].append(1 - abs(prefix_test_rate - suffix_test_rate))
+            if prefix_eval["test_result"]["suite_passed"] == suffix_eval["test_result"]["suite_passed"]:
+                metrics["test_suite_agreement_count"] += 1
+
         print(f"Sample {sample['index']} | {model_label} raw: {format_score(raw_score)}")
 
     return metrics
+
+
+def evaluate_test_metrics_only(model_key, samples, model_results):
+    model_label = MODEL_REGISTRY[model_key]["label"]
+    metrics = initialize_metrics()
+
+    print(f"\n=== Test Results: {model_label} Prefix vs Suffix ===")
+    for index, sample in enumerate(samples):
+        result = model_results[index]
+
+        prefix_eval = evaluate_generation(result["prefix_output"], "", sample.get("tests", ""))
+        suffix_eval = evaluate_generation(result["suffix_output"], "", sample.get("tests", ""))
+
+        for generation in (prefix_eval, suffix_eval):
+            record_generation(metrics, generation)
+
+        prefix_test_rate = prefix_eval["test_result"]["pass_rate"]
+        suffix_test_rate = suffix_eval["test_result"]["pass_rate"]
+        if prefix_test_rate is not None and suffix_test_rate is not None:
+            metrics["test_pair_count"] += 1
+            metrics["test_invariance_scores"].append(1 - abs(prefix_test_rate - suffix_test_rate))
+            if prefix_eval["test_result"]["suite_passed"] == suffix_eval["test_result"]["suite_passed"]:
+                metrics["test_suite_agreement_count"] += 1
+
+        print(
+            f"Sample {sample['index']} | {model_label} test pass rates: "
+            f"{format_score(prefix_test_rate)} vs {format_score(suffix_test_rate)}"
+        )
+
+    for key in AST_METRIC_KEYS:
+        if key in metrics:
+            metrics[key] = initialize_metrics()[key]
+
+    return {key: metrics[key] for key in TEST_METRIC_KEYS}
 
 
 def get_or_evaluate_model_results(model_key, samples, model_results):
@@ -294,6 +429,13 @@ def get_or_evaluate_model_results(model_key, samples, model_results):
     if metrics_cache_complete(metrics_cache, len(samples)):
         print(f"Skipping evaluation for {MODEL_REGISTRY[model_key]['label']}; cached metrics are complete.")
         return metrics_cache
+
+    if metrics_cache_has_ast(metrics_cache, len(samples)) and not metrics_cache_has_test(metrics_cache, len(samples)):
+        print(f"Upgrading cached AST metrics for {MODEL_REGISTRY[model_key]['label']} with test-suite evaluation only.")
+        test_metrics = evaluate_test_metrics_only(model_key, samples, model_results)
+        merged_metrics = merge_cached_metrics(metrics_cache, test_metrics)
+        save_evaluation_cache(model_key, merged_metrics)
+        return merged_metrics
 
     metrics = evaluate_model_results(model_key, samples, model_results)
     save_evaluation_cache(model_key, metrics)
@@ -373,6 +515,10 @@ def main():
     if ar_group["correct_filtered_invariance_scores"] and diffusion_group["correct_filtered_invariance_scores"]:
         correct_bias_gap = average_metric(diffusion_group["correct_filtered_invariance_scores"]) - average_metric(ar_group["correct_filtered_invariance_scores"])
 
+    test_bias_gap = None
+    if ar_group["test_invariance_scores"] and diffusion_group["test_invariance_scores"]:
+        test_bias_gap = average_metric(diffusion_group["test_invariance_scores"]) - average_metric(ar_group["test_invariance_scores"])
+
     print("\n=== Model Runtime Summary ===")
     for group_name, model_keys in MODEL_GROUPS.items():
         print(f"{group_name.upper()}:")
@@ -381,6 +527,7 @@ def main():
 
     print(f"\nFiltered Recency Bias Gap (Diffusion vs AR groups): {format_score(filtered_bias_gap)}")
     print(f"Gold-Conditioned Bias Gap (Diffusion vs AR groups): {format_score(correct_bias_gap)}")
+    print(f"Test-Suite Bias Gap (Diffusion vs AR groups): {format_score(test_bias_gap)}")
 
 if __name__ == "__main__":
     if torch.cuda.is_available():

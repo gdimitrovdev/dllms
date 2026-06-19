@@ -15,6 +15,7 @@ def load_canitedit_sample(split_name="test", index=0):
     sample = dataset[split_name][index]
     before_code = sample["before"]
     instruction = sample["instruction_descriptive"]
+    tests = sample["tests"]
     
     # TODO: Replace with automated sentence-splitting logic later
     mock_constraints = [
@@ -22,7 +23,7 @@ def load_canitedit_sample(split_name="test", index=0):
         "Ensure the time complexity remains O(n)."
     ]
     
-    return before_code, instruction, mock_constraints
+    return before_code, instruction, mock_constraints, tests
 
 def load_all_canitedit_samples(split_name="test", limit=100):
     """
@@ -47,6 +48,7 @@ def load_all_canitedit_samples(split_name="test", limit=100):
         before_code = sample["before"]
         after_code = sample["after"]
         instruction = sample["instruction_descriptive"]
+        tests = sample.get("tests", "")
         
         # Keep the mock constraints as in original code
         mock_constraints = [
@@ -58,7 +60,8 @@ def load_all_canitedit_samples(split_name="test", limit=100):
             "before": before_code,
             "after": after_code,
             "instruction": instruction,
-            "constraints": mock_constraints
+            "constraints": mock_constraints,
+            "tests": tests,
         })
     return samples
 
