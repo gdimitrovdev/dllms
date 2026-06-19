@@ -1,10 +1,18 @@
 # Comparison between Autoregressive LLMs and Diffusion LLMs
 
 ## Models
-TODO
+**Autoregressive Models:**
+- Qwen2.5-Coder-7B-Instruct (`Qwen/Qwen2.5-Coder-7B-Instruct`)
+- DeepSeek-Coder-6.7B-Instruct (`deepseek-ai/deepseek-coder-6.7b-instruct`)
+- Qwen3-8B (`Qwen/Qwen3-8B`)
+
+**Diffusion Models:**
+- Dream-Coder-v0-Instruct-7B (`Dream-org/Dream-Coder-v0-Instruct-7B`)
+- LLaDA-8B-Instruct (`GSAI-ML/LLaDA-8B-Instruct`)
+- DiffuCoder-7B-cpGRPO (`apple/DiffuCoder-7B-cpGRPO`)
 
 ## Dataset
-TODO
+The evaluation is performed using the `nuprl/CanItEdit` dataset from Hugging Face.
 
 ## How to run locally
 1. Create and activate a python virtual environment:
@@ -43,7 +51,7 @@ pip install -r <dllms_path>/requirements.txt
 ```
 
 4. Download the models and dataset for offline access from your /scratch folder:
-```
+```bash
 mkdir -p /scratch/<netid>/hf_cache
 
 export HF_HOME=/scratch/<netid>/hf_cache
@@ -52,17 +60,12 @@ export TRANSFORMERS_CACHE=/scratch/<netid>/hf_cache
 module load 2025
 module load python
 
-python -c "from transformers import AutoTokenizer, AutoConfig; AutoTokenizer.from_pretrained('Qwen/Qwen2.5-Coder-7B-Instruct'); AutoConfig.from_pretrained('Qwen/Qwen2.5-Coder-7B-Instruct')"
-python -c "from transformers import AutoModelForCausalLM; AutoModelForCausalLM.from_pretrained('Qwen/Qwen2.5-Coder-7B-Instruct')"
-
-python -c "from transformers import AutoTokenizer, AutoModelForCausalLM; AutoTokenizer.from_pretrained('inclusionAI/LLaDA2.1-mini'); AutoModelForCausalLM.from_pretrained('inclusionAI/LLaDA2.1-mini', trust_remote_code=True)"
-
-python -c "from datasets import load_dataset; load_dataset('nuprl/CanItEdit')"
+python download_models.py
 ```
 
 5. Use the following sbatch script to run the comparison:
 
-```
+```bash
 #!/bin/bash
 #
 #SBATCH --job-name="dllms"
@@ -88,3 +91,26 @@ export TRANSFORMERS_OFFLINE=1
 
 srun python main.py
 ```
+
+## Running Models Separately (Transformers Versions)
+Because of compatibility issues, different `transformers` versions are required for the different model families:
+- **Autoregressive Models** run smoothly with the `transformers` version in `requirements.txt` (which includes a custom shim in the pipeline).
+- **Diffusion Models** require an older `transformers` version (e.g., `transformers==4.38.2`) due to custom generation code and masking utilities.
+
+You will need to make separate runs for AR models and Diffusion models by commenting out the respective groups in `pipeline.py` and running them in separate conda environments with the appropriate `transformers` versions installed.
+
+## Caching Mechanisms
+This project employs two main caching mechanisms:
+1. **Hugging Face Cache**: Model weights and the `nuprl/CanItEdit` dataset are cached in `HF_HOME`. Run the `download_models.py` script to populate this cache locally before running jobs in an offline cluster environment.
+2. **Results Cache (`cache_artifacts/`)**: The outputs from each model (prefix and suffix generations) and their evaluated metrics are saved as JSON files in the `cache_artifacts/` directory. If a run is interrupted or if you restart the pipeline, it will automatically load cached generation results, bypassing the expensive model inference steps.
+
+## Repository Structure
+- `main.py`: The entry point script that orchestrates the execution of the evaluation pipeline and aggregates metrics.
+- `pipeline.py`: Defines the models used (AR and Diffusion), manages the generation code for each model family, and controls inference.
+- `data.py`: Responsible for loading and processing the `nuprl/CanItEdit` dataset.
+- `evaluation.py`: Evaluates the generated code by checking AST validity, computing deviation from gold code, and running test assertions.
+- `permutations.py`: Generates the positional prompts (prefix vs suffix configurations) to evaluate order-invariance.
+- `utils.py`: Contains helper functions such as python code extraction and checking for degenerate outputs.
+- `download_models.py`: A standalone script to cache model weights and the dataset locally before running the pipeline on a cluster.
+- `requirements.txt`: Python package dependencies.
+- `cache_artifacts/`: Directory for caching model generations and evaluated metrics per model to save inference time on subsequent runs. This folder is part of the .gitignore and is generated while the comparison is running.
