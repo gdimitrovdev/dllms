@@ -103,3 +103,14 @@ You will need to make separate runs for AR models and Diffusion models by commen
 This project employs two main caching mechanisms:
 1. **Hugging Face Cache**: Model weights and the `nuprl/CanItEdit` dataset are cached in `HF_HOME`. Run the `download_models.py` script to populate this cache locally before running jobs in an offline cluster environment.
 2. **Results Cache (`cache_artifacts/`)**: The outputs from each model (prefix and suffix generations) and their evaluated metrics are saved as JSON files in the `cache_artifacts/` directory. If a run is interrupted or if you restart the pipeline, it will automatically load cached generation results, bypassing the expensive model inference steps.
+
+## Repository Structure
+- `main.py`: The entry point script that orchestrates the execution of the evaluation pipeline and aggregates metrics.
+- `pipeline.py`: Defines the models used (AR and Diffusion), manages the generation code for each model family, and controls inference.
+- `data.py`: Responsible for loading and processing the `nuprl/CanItEdit` dataset.
+- `evaluation.py`: Evaluates the generated code by checking AST validity, computing deviation from gold code, and running test assertions.
+- `permutations.py`: Generates the positional prompts (prefix vs suffix configurations) to evaluate order-invariance.
+- `utils.py`: Contains helper functions such as python code extraction and checking for degenerate outputs.
+- `download_models.py`: A standalone script to cache model weights and the dataset locally before running the pipeline on a cluster.
+- `requirements.txt`: Python package dependencies.
+- `cache_artifacts/`: Directory for caching model generations and evaluated metrics per model to save inference time on subsequent runs. This folder is part of the .gitignore and is generated while the comparison is running.
